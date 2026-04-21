@@ -1,0 +1,20 @@
+{
+  "name": "wp-theme-builder-figma-plugin",
+  "version": "1.0.0",
+  "description": "Figma plugin that exports structured design data for the WordPress + ACF theme builder agent system",
+  "scripts": {
+    "dev": "NODE_ENV=development node esbuild.config.mjs",
+    "build": "NODE_ENV=production node esbuild.config.mjs",
+    "watch": "nodemon --watch src -e ts,tsx,css --exec 'node esbuild.config.mjs'"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.100.2",
+    "esbuild": "^0.21.5",
+    "nodemon": "^3.1.4",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "preact": "^10.22.1"
+  }
+}
