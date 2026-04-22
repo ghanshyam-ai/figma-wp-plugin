@@ -11,6 +11,7 @@ import { parseSections } from './section-parser';
 import { matchResponsiveFrames } from './responsive';
 import { buildExportTasks, executeBatchExport, buildImageMap } from './image-exporter';
 import { extractVariables } from './variables';
+import { normalizeSectionName } from './patterns';
 
 /**
  * Master extraction orchestrator.
@@ -29,6 +30,11 @@ export async function runExtraction(
   let totalSections = 0;
   let totalImages = 0;
 
+  // Pre-compute the set of section names that appear on ≥2 selected pages.
+  // These are candidates for global WP theme parts (header.php / footer.php
+  // / template-parts). parseSections will mark matching sections isGlobal.
+  const globalNames = computeGlobalSectionNames(responsivePairs);
+
   // Process each responsive pair (each = one page)
   for (const pair of responsivePairs) {
     if (shouldCancel()) return;
@@ -45,7 +51,7 @@ export async function runExtraction(
     });
 
     // ── Parse sections from desktop frame ──
-    const sections = parseSections(desktopFrame);
+    const sections = parseSections(desktopFrame, globalNames);
     const sectionCount = Object.keys(sections).length;
     totalSections += sectionCount;
 
@@ -54,7 +60,7 @@ export async function runExtraction(
       const mobileNode = figma.getNodeById(pair.mobile.frameId);
       if (mobileNode && mobileNode.type === 'FRAME') {
         const mobileFrame = mobileNode as FrameNode;
-        const mobileSections = parseSections(mobileFrame);
+        const mobileSections = parseSections(mobileFrame, globalNames);
         mergeResponsiveData(sections, mobileSections, pair.mobile.width);
       }
     }
@@ -372,6 +378,56 @@ function countImages(node: SceneNode): number {
   }
   walk(node);
   return count;
+}
+
+/**
+ * Pre-compute the set of normalized section names that appear on ≥2 selected
+ * pages. Matching sections will be marked `isGlobal: true` by parseSections
+ * so the WP agent can hoist them into header.php / footer.php / template-parts
+ * rather than inlining the same markup on every page.
+ *
+ * The scan mirrors identifySections (drills one wrapper deep when the page
+ * has a single container child) so the matching stays consistent with what
+ * parseSections actually treats as a "section".
+ */
+function computeGlobalSectionNames(pairs: ResponsivePair[]): Set<string> {
+  const nameToPageCount = new Map<string, number>();
+
+  for (const pair of pairs) {
+    try {
+      const node = figma.getNodeById(pair.desktop.frameId);
+      if (!node || node.type !== 'FRAME') continue;
+      const frame = node as FrameNode;
+      let candidates = frame.children.filter(c =>
+        c.visible !== false &&
+        (c.type === 'FRAME' || c.type === 'COMPONENT' || c.type === 'INSTANCE' || c.type === 'GROUP')
+      );
+      if (candidates.length === 1 && 'children' in candidates[0]) {
+        const inner = (candidates[0] as FrameNode).children.filter(c =>
+          c.visible !== false &&
+          (c.type === 'FRAME' || c.type === 'COMPONENT' || c.type === 'INSTANCE' || c.type === 'GROUP')
+        );
+        if (inner.length > 1) candidates = inner;
+      }
+      const seenOnThisPage = new Set<string>();
+      for (const c of candidates) {
+        const key = normalizeSectionName(c.name || '');
+        if (!key) continue;
+        seenOnThisPage.add(key);
+      }
+      for (const name of seenOnThisPage) {
+        nameToPageCount.set(name, (nameToPageCount.get(name) || 0) + 1);
+      }
+    } catch (e) {
+      console.warn('computeGlobalSectionNames: failed to scan frame', pair.pageName, e);
+    }
+  }
+
+  const out = new Set<string>();
+  for (const [name, count] of nameToPageCount) {
+    if (count >= 2) out.add(name);
+  }
+  return out;
 }
 
 function collectImageFileNames(node: SceneNode): string[] {

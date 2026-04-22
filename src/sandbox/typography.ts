@@ -1,6 +1,6 @@
-import { ElementStyles } from './types';
+import { ElementStyles, TextSegment } from './types';
 import { toCssValue } from './utils';
-import { extractTextColor } from './color';
+import { extractTextColor, rgbToHex } from './color';
 import { extractEffects } from './effects';
 
 /**
@@ -117,7 +117,81 @@ export function extractTypography(node: TextNode): Partial<ElementStyles> {
   const effects = extractEffects(node);
   if (effects.textShadow) styles.textShadow = effects.textShadow;
 
+  // Figma Text Style reference (design token for typography)
+  const styleName = extractTextStyleName(node);
+  if (styleName) styles.textStyleName = styleName;
+
+  // Styled text segments — only when the text has mixed inline styles
+  const segments = extractTextSegments(node);
+  if (segments) styles.textSegments = segments;
+
   return styles;
+}
+
+/**
+ * Extract the bound Figma Text Style name (e.g. "Heading/H2").
+ * Returns null when the text node has no style binding, or the binding is mixed.
+ */
+export function extractTextStyleName(node: TextNode): string | null {
+  try {
+    const id = (node as any).textStyleId;
+    if (!id || id === figma.mixed || typeof id !== 'string') return null;
+    const style = figma.getStyleById(id);
+    return style?.name || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract styled text segments so inline formatting (bold word, colored span,
+ * underlined link inside a paragraph) survives the export. Returns null when
+ * the text has no mixed styles — in that case the element-level typography
+ * already describes the whole text uniformly.
+ */
+export function extractTextSegments(node: TextNode): TextSegment[] | null {
+  if (!node.characters) return null;
+  try {
+    const getSegments = (node as any).getStyledTextSegments;
+    if (typeof getSegments !== 'function') return null;
+    const raw = getSegments.call(node, ['fontName', 'fontSize', 'fills', 'textDecoration']);
+    if (!raw || !Array.isArray(raw) || raw.length <= 1) return null;
+
+    const segments: TextSegment[] = raw.map((s: any) => {
+      const seg: TextSegment = { text: s.characters || '' };
+      if (s.fontName && typeof s.fontName === 'object') {
+        seg.fontFamily = s.fontName.family;
+        seg.fontWeight = fontWeightFromStyle(s.fontName.style);
+        if (s.fontName.style.toLowerCase().includes('italic')) seg.italic = true;
+      }
+      if (typeof s.fontSize === 'number') seg.fontSize = s.fontSize;
+      if (Array.isArray(s.fills)) {
+        for (const f of s.fills) {
+          if (f.type === 'SOLID' && f.visible !== false) {
+            seg.color = rgbToHex(f.color);
+            break;
+          }
+        }
+      }
+      if (s.textDecoration === 'UNDERLINE') seg.textDecoration = 'underline';
+      else if (s.textDecoration === 'STRIKETHROUGH') seg.textDecoration = 'line-through';
+      return seg;
+    });
+
+    // If every segment's styling is identical, the segmentation adds nothing.
+    const first = segments[0];
+    const allSame = segments.every(s =>
+      s.fontFamily === first.fontFamily &&
+      s.fontWeight === first.fontWeight &&
+      s.fontSize === first.fontSize &&
+      s.color === first.color &&
+      s.italic === first.italic &&
+      s.textDecoration === first.textDecoration
+    );
+    return allSame ? null : segments;
+  } catch {
+    return null;
+  }
 }
 
 /**

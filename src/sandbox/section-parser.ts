@@ -1,11 +1,16 @@
-import { SectionSpec, SectionStyles, ElementStyles, OverlapInfo, LayerInfo, CompositionInfo, FormFieldInfo, TextContentEntry } from './types';
-import { toCssValue, toLayoutName, screenshotFilename, computeAspectRatio } from './utils';
+import { SectionSpec, SectionStyles, ElementStyles, OverlapInfo, LayerInfo, CompositionInfo, FormFieldInfo, TextContentEntry, ComponentInstanceInfo } from './types';
+import { toCssValue, toLayoutName, screenshotFilename, computeAspectRatio, isDefaultLayerName } from './utils';
 import { extractBackgroundColor, extractGradient, hasImageFill, extractBorderStyle, extractBorderWidths, extractStrokeColor } from './color';
 import { extractTypography } from './typography';
 import { extractAutoLayoutSpacing, extractAbsoluteSpacing } from './spacing';
 import { detectGrid } from './grid';
 import { extractInteractions } from './interactions';
 import { extractEffects } from './effects';
+import { toCssCustomProperty } from './variables';
+import {
+  detectRepeaters, detectComponentPatterns, detectNavigation,
+  inferSectionType, normalizeSectionName, classifyGlobalRole,
+} from './patterns';
 
 /**
  * Identify section frames within a page frame.
@@ -290,6 +295,172 @@ function extractLinkUrl(node: any): string | null {
 }
 
 /**
+ * Extract Figma sizing modes (Hug / Fill / Fixed). These tell the agent
+ * whether an element should be width:auto, width:100%, or a fixed px size —
+ * critical for correct responsive behavior. Returns null for each axis when
+ * the mode is missing (older Figma versions, non-auto-layout contexts).
+ */
+function extractSizingModes(node: any): { widthMode: 'hug'|'fill'|'fixed'|null; heightMode: 'hug'|'fill'|'fixed'|null } {
+  const map = (m: string | undefined): 'hug'|'fill'|'fixed'|null => {
+    if (m === 'HUG') return 'hug';
+    if (m === 'FILL') return 'fill';
+    if (m === 'FIXED') return 'fixed';
+    return null;
+  };
+  return {
+    widthMode: map(node.layoutSizingHorizontal),
+    heightMode: map(node.layoutSizingVertical),
+  };
+}
+
+/**
+ * Extract Figma Variable bindings on a node's properties. Returns CSS custom
+ * property references (e.g. "var(--clr-primary)") keyed by CSS property name.
+ * When variables are bound, the agent should emit these references instead
+ * of the resolved raw hex/px values so token changes in Figma propagate.
+ */
+function extractBoundVariables(node: any): Record<string, string> | null {
+  const bv = node.boundVariables;
+  if (!bv || typeof bv !== 'object') return null;
+  if (!figma.variables || typeof (figma.variables as any).getVariableById !== 'function') return null;
+
+  const out: Record<string, string> = {};
+
+  const resolve = (alias: any): string | null => {
+    if (!alias || !alias.id) return null;
+    try {
+      const v = (figma.variables as any).getVariableById(alias.id);
+      if (!v) return null;
+      let colName = '';
+      try {
+        const col = (figma.variables as any).getVariableCollectionById?.(v.variableCollectionId);
+        colName = col?.name || '';
+      } catch {}
+      return `var(${toCssCustomProperty(v.name, colName)})`;
+    } catch {
+      return null;
+    }
+  };
+
+  if (Array.isArray(bv.fills) && bv.fills[0]) {
+    const ref = resolve(bv.fills[0]);
+    if (ref) out[node.type === 'TEXT' ? 'color' : 'backgroundColor'] = ref;
+  }
+  if (Array.isArray(bv.strokes) && bv.strokes[0]) {
+    const ref = resolve(bv.strokes[0]);
+    if (ref) out.borderColor = ref;
+  }
+  const numericMap: Record<string, string> = {
+    paddingTop: 'paddingTop', paddingBottom: 'paddingBottom',
+    paddingLeft: 'paddingLeft', paddingRight: 'paddingRight',
+    itemSpacing: 'gap',
+    cornerRadius: 'borderRadius',
+    topLeftRadius: 'borderTopLeftRadius', topRightRadius: 'borderTopRightRadius',
+    bottomLeftRadius: 'borderBottomLeftRadius', bottomRightRadius: 'borderBottomRightRadius',
+    strokeWeight: 'borderWidth',
+    fontSize: 'fontSize', lineHeight: 'lineHeight', letterSpacing: 'letterSpacing',
+  };
+  for (const [figmaKey, cssKey] of Object.entries(numericMap)) {
+    if (bv[figmaKey]) {
+      const ref = resolve(bv[figmaKey]);
+      if (ref) out[cssKey] = ref;
+    }
+  }
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
+ * Extract component-instance metadata: main component name + variant
+ * / boolean / text properties. Returns null for non-instance nodes.
+ * This is the key signal the agent uses to dedupe repeated cards, buttons,
+ * and icons into shared ACF blocks instead of inlining each one.
+ */
+function extractComponentInstance(node: SceneNode): ComponentInstanceInfo | null {
+  if (node.type !== 'INSTANCE') return null;
+  try {
+    const inst = node as InstanceNode;
+    let name = inst.name;
+    try {
+      const main = inst.mainComponent;
+      if (main) {
+        name = main.parent?.type === 'COMPONENT_SET' ? (main.parent as any).name : main.name;
+      }
+    } catch {}
+    const properties: Record<string, string | boolean | number> = {};
+    const props = (inst as any).componentProperties;
+    if (props && typeof props === 'object') {
+      for (const [key, val] of Object.entries(props)) {
+        const v = (val as any)?.value;
+        if (typeof v === 'string' || typeof v === 'boolean' || typeof v === 'number') {
+          properties[key] = v;
+        }
+      }
+    }
+    return { name, properties };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract alt text for an image. Source priority: component description
+ * (for INSTANCE / COMPONENT nodes) → humanized layer name. Returns empty
+ * string when the layer is named generically (Rectangle 12, Image 3, etc.).
+ */
+function extractAltText(node: SceneNode): string {
+  try {
+    if (node.type === 'INSTANCE') {
+      const main = (node as InstanceNode).mainComponent;
+      if (main && main.description && main.description.trim()) return main.description.trim();
+    }
+    if (node.type === 'COMPONENT') {
+      const desc = (node as ComponentNode).description;
+      if (desc && desc.trim()) return desc.trim();
+    }
+  } catch {}
+  if (!node.name || isDefaultLayerName(node.name)) return '';
+  return node.name.replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim().replace(/\b\w/g, c => c.toUpperCase());
+}
+
+/**
+ * Map Figma's IMAGE fill scaleMode to CSS object-fit.
+ *   FILL (default) → cover
+ *   FIT            → contain (image visible in full, letterbox if needed)
+ *   CROP           → cover (object-position handled separately via imageTransform)
+ *   TILE           → cover (no direct CSS equivalent)
+ */
+function getImageObjectFit(node: any): string {
+  if (!node.fills || !Array.isArray(node.fills)) return 'cover';
+  const imgFill = node.fills.find((f: Paint) => f.type === 'IMAGE' && f.visible !== false) as ImagePaint | undefined;
+  if (!imgFill) return 'cover';
+  switch (imgFill.scaleMode) {
+    case 'FIT': return 'contain';
+    case 'FILL':
+    case 'CROP':
+    case 'TILE':
+    default: return 'cover';
+  }
+}
+
+/**
+ * Apply the shared optional-signal fields (componentInstance, widthMode,
+ * heightMode, varBindings) to an element. Centralized so every element
+ * kind (text, image, button, input) benefits consistently.
+ */
+function applyCommonSignals(elem: Partial<ElementStyles>, node: SceneNode): void {
+  const cmp = extractComponentInstance(node);
+  if (cmp) elem.componentInstance = cmp;
+
+  const size = extractSizingModes(node);
+  if (size.widthMode) elem.widthMode = size.widthMode;
+  if (size.heightMode) elem.heightMode = size.heightMode;
+
+  const vars = extractBoundVariables(node);
+  if (vars) elem.varBindings = vars;
+}
+
+/**
  * Find and classify all meaningful elements within a section.
  * Walks the node tree and extracts typography for TEXT nodes,
  * dimensions for image containers, etc.
@@ -350,6 +521,9 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
         }
       }
 
+      // Common signals: componentInstance, sizing modes, bound variables
+      applyCommonSignals(typo, node);
+
       elements[role] = typo;
       textIndex++;
     }
@@ -404,7 +578,7 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
         width: isBackgroundImage ? '100%' : toCssValue(Math.round(bounds.width)),
         height: isBackgroundImage ? '100%' : 'auto',
         aspectRatio: isBackgroundImage ? null : computeAspectRatio(bounds.width, bounds.height),
-        objectFit: 'cover',
+        objectFit: getImageObjectFit(node as any),
         objectPosition: imgObjectPosition,
         overflow: (parentClips || clipBorderRadius) ? 'hidden' : null,
         hasMask: isMasked || null,
@@ -416,6 +590,9 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
         left: isBackgroundImage ? '0px' : null,
         zIndex: isBackgroundImage ? 0 : null,
       };
+      const imgAlt = extractAltText(node);
+      if (imgAlt) imgElem.alt = imgAlt;
+      applyCommonSignals(imgElem, node);
       // Apply radius — per-corner if node has differing corners, uniform otherwise
       if (imgCorners) {
         if (imgCorners.uniform !== null) {
@@ -477,6 +654,9 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
 
         Object.assign(buttonStyles, extractFlexChildProps(frame as any));
 
+        // Common signals: componentInstance (button variants!), sizing, vars
+        applyCommonSignals(buttonStyles, frame);
+
         const cleanName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
         elements[cleanName || 'button'] = buttonStyles;
       }
@@ -507,6 +687,8 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
           fontSize: placeholderTypo.fontSize || null,
         };
       }
+      applyCommonSignals(inputStyles, frame);
+
       const inputName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'input';
       elements[inputName] = inputStyles;
       return; // Don't recurse into input internals
@@ -873,7 +1055,16 @@ function extractTextContentInOrder(sectionNode: SceneNode): TextContentEntry[] {
   });
 }
 
-export function parseSections(pageFrame: FrameNode): Record<string, SectionSpec> {
+/**
+ * Parse sections from a page frame.
+ *
+ * @param pageFrame The top-level page frame to walk.
+ * @param globalNames Optional set of normalized section names that appear on
+ *                    ≥2 selected pages. When provided, matching sections are
+ *                    marked `isGlobal: true` so the agent can promote them to
+ *                    shared WP theme parts instead of duplicating per-page.
+ */
+export function parseSections(pageFrame: FrameNode, globalNames?: Set<string>): Record<string, SectionSpec> {
   const sectionNodes = identifySections(pageFrame);
   const specs: Record<string, SectionSpec> = {};
 
@@ -979,6 +1170,63 @@ export function parseSections(pageFrame: FrameNode): Record<string, SectionSpec>
     // Ordered text content — every text in reading order (for page-assembler mapping)
     const textContentInOrder = extractTextContentInOrder(node);
 
+    // Pattern detection (carousel / accordion / tabs / modal)
+    let componentPatterns: ReturnType<typeof detectComponentPatterns> | undefined;
+    try {
+      const p = detectComponentPatterns(node);
+      if (p.length > 0) componentPatterns = p;
+    } catch (e) {
+      console.warn('detectComponentPatterns failed for section', node.name, e);
+    }
+
+    // Repeater detection (cards / features / pricing / etc.)
+    let repeaters: ReturnType<typeof detectRepeaters> | undefined;
+    try {
+      const r = detectRepeaters(node);
+      if (Object.keys(r).length > 0) repeaters = r;
+    } catch (e) {
+      console.warn('detectRepeaters failed for section', node.name, e);
+    }
+
+    // Global detection (cross-page)
+    const normalized = normalizeSectionName(node.name);
+    const isGlobal = globalNames ? globalNames.has(normalized) : false;
+    const globalRole = isGlobal
+      ? classifyGlobalRole(i, sectionNodes.length, Math.round(bounds.height))
+      : null;
+
+    // Navigation (only worth computing for header/footer candidates)
+    let navigation: NonNullable<ReturnType<typeof detectNavigation>> | undefined;
+    try {
+      const name = (node.name || '').toLowerCase();
+      if (isGlobal || /\b(header|footer|nav|navbar|navigation)\b/.test(name)) {
+        const nav = detectNavigation(node);
+        if (nav) navigation = nav;
+      }
+    } catch (e) {
+      console.warn('detectNavigation failed for section', node.name, e);
+    }
+
+    // Section semantic role inference
+    let sectionType: ReturnType<typeof inferSectionType> | null = null;
+    try {
+      sectionType = inferSectionType({
+        sectionIndex: i,
+        totalSections: sectionNodes.length,
+        isFormSection: formResult.isForm,
+        patterns: componentPatterns || [],
+        repeaters: repeaters || {},
+        elements,
+        textContentInOrder,
+        layerName: node.name || '',
+        sectionHeight: Math.round(bounds.height),
+        isGlobal,
+        globalRole,
+      });
+    } catch (e) {
+      console.warn('inferSectionType failed for section', node.name, e);
+    }
+
     specs[layoutName] = {
       spacingSource,
       figmaNodeId: node.id,
@@ -993,6 +1241,13 @@ export function parseSections(pageFrame: FrameNode): Record<string, SectionSpec>
       isFormSection: formResult.isForm || undefined,
       formFields: formResult.fields.length > 0 ? formResult.fields : undefined,
       textContentInOrder: textContentInOrder.length > 0 ? textContentInOrder : undefined,
+      componentPatterns,
+      isGlobal: isGlobal || undefined,
+      globalRole: isGlobal ? globalRole : undefined,
+      sectionType: sectionType?.type,
+      sectionTypeConfidence: sectionType?.confidence,
+      repeaters,
+      navigation,
     };
 
     prevBottom = bounds.y + bounds.height;

@@ -58,6 +58,73 @@ export interface SectionSpec {
    *  Used by page-assembler for positional content mapping when designers
    *  do not name layers consistently. Every text from Figma is preserved. */
   textContentInOrder?: TextContentEntry[];
+  /** Detected interactive component patterns — carousel, accordion, tabs, modal.
+   *  Heuristic-based; low-confidence entries should be verified against the
+   *  screenshot before the agent emits specialised markup. */
+  componentPatterns?: ComponentPattern[];
+  /** True when this section matches (by name) a section on ≥2 selected pages.
+   *  Global sections should be promoted to WP theme parts (header.php / footer.php
+   *  or template-parts/) instead of duplicated into each page template. */
+  isGlobal?: boolean;
+  /** Semantic role of a global section when it can be classified. */
+  globalRole?: 'header' | 'footer' | null;
+  /** Inferred semantic type — the agent uses this to pick the right ACF
+   *  flexible-content layout (hero / features / pricing / contact …).
+   *  Falls back to 'generic' when nothing matches confidently. */
+  sectionType?: SectionType;
+  /** Confidence in the sectionType inference:
+   *    'high' — explicit layer-name match or strong pattern signal
+   *    'low'  — inferred from content shape; agent should double-check */
+  sectionTypeConfidence?: 'high' | 'low';
+  /** Detected repeater groups inside this section, keyed by container name.
+   *  Each entry has a template layer + one content object per item so the
+   *  agent can emit an ACF Repeater field instead of individual fields. */
+  repeaters?: Record<string, RepeaterInfo>;
+  /** Navigation links detected inside this section (usually header/footer). */
+  navigation?: NavigationInfo;
+}
+
+export type SectionType =
+  | 'hero' | 'features' | 'testimonials' | 'cta' | 'faq' | 'pricing'
+  | 'contact' | 'logos' | 'footer' | 'header' | 'blog_grid' | 'generic';
+
+export interface ComponentPattern {
+  type: 'carousel' | 'accordion' | 'tabs' | 'modal';
+  rootNodeId: string;
+  rootNodeName: string;
+  /** Number of detected items in the pattern (slides, accordion items, tabs). */
+  itemCount?: number;
+  /** 'high' when the layer name explicitly matches; 'low' when inferred. */
+  confidence: 'high' | 'low';
+  /** Per-type metadata (accordion items[], carousel layout hints, etc.). */
+  meta?: Record<string, unknown>;
+}
+
+export interface RepeaterInfo {
+  /** Layer name of the parent that holds the repeated items. */
+  containerLayerName: string;
+  /** Number of detected items. */
+  itemCount: number;
+  /** Layer name of the first item — a stable key hint for ACF. */
+  templateLayerName: string;
+  /** Content extracted from each item. */
+  items: RepeaterItem[];
+}
+
+export interface RepeaterItem {
+  /** Per-role text content: { title: "Fast", description: "…" } */
+  texts: Record<string, string>;
+  /** Image filename when the item has a primary image fill. */
+  imageFile?: string;
+  /** Alt text if derivable from layer name or component description. */
+  alt?: string;
+  /** Prototype link URL if the item has an OPEN_URL action. */
+  linkUrl?: string;
+}
+
+export interface NavigationInfo {
+  /** Short text links found inside the section. */
+  links: Array<{ label: string; href?: string | null }>;
 }
 
 export interface TextContentEntry {
@@ -192,6 +259,46 @@ export interface ElementStyles {
   overflow?: string | null;
   /** Prototype link destination URL (if Figma prototype points to external URL) */
   linkUrl?: string | null;
+  /** Figma Text Style name bound to this text node (e.g., "Heading/H2").
+   *  When present, the agent should map to the theme's typography class/token
+   *  instead of re-inlining fontSize/lineHeight/etc. */
+  textStyleName?: string | null;
+  /** Inline rich-text segments — emitted ONLY when the text has mixed styles
+   *  (e.g. a bold word inside a paragraph, or a colored span). When absent,
+   *  the uniform styles on this element apply to the entire textContent. */
+  textSegments?: TextSegment[] | null;
+  /** Alt text for images — sourced from component description when the node
+   *  is a component instance, otherwise a humanized layer name. Empty when
+   *  the source is a default Figma-generated name. */
+  alt?: string | null;
+  /** Component instance metadata — present when the node is a Figma INSTANCE.
+   *  Lets the agent deduplicate repeated instances into a shared ACF block/pattern. */
+  componentInstance?: ComponentInstanceInfo | null;
+  /** Figma width sizing mode: 'hug' (auto) | 'fill' (100%) | 'fixed' (explicit px). */
+  widthMode?: 'hug' | 'fill' | 'fixed' | null;
+  /** Figma height sizing mode: 'hug' (auto) | 'fill' (100%) | 'fixed' (explicit px). */
+  heightMode?: 'hug' | 'fill' | 'fixed' | null;
+  /** Bound Figma Variable references on this element's properties, as CSS
+   *  custom-property references (e.g. { color: "var(--clr-primary)" }).
+   *  Agents should prefer these over raw hex/px values when present. */
+  varBindings?: Record<string, string> | null;
+}
+
+export interface TextSegment {
+  text: string;
+  fontFamily?: string;
+  fontWeight?: number;
+  fontSize?: number;
+  color?: string;
+  italic?: boolean;
+  textDecoration?: string;
+}
+
+export interface ComponentInstanceInfo {
+  /** Main component or component-set name (e.g., "Button", "Card/Primary"). */
+  name: string;
+  /** Variant / boolean / text properties set on this instance. */
+  properties: Record<string, string | boolean | number>;
 }
 
 export interface GridSpec {
