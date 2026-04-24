@@ -61,7 +61,7 @@ export function buildExportTasks(pageFrame: FrameNode, pageSlug: string): ImageE
       nodeId: sections[i].id,
       nodeName: sections[i].name,
       type: 'screenshot',
-      filename: screenshotFilename(i + 1, sections[i].name),
+      filename: screenshotFilename(sections[i].name),
       pagePath,
       format: 'PNG',
       scale: 1,

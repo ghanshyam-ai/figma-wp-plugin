@@ -49,12 +49,11 @@ export function nodeIdToString(id: string): string {
 }
 
 /**
- * Generate a zero-padded screenshot filename.
- * (1, "Hero Section") → "01-hero-section.png"
+ * Generate a screenshot filename from the section's layout name.
+ * "Hero Section" → "hero-section.png"
  */
-export function screenshotFilename(index: number, name: string): string {
-  const padded = String(index).padStart(2, '0');
-  return `${padded}-${slugify(name)}.png`;
+export function screenshotFilename(name: string): string {
+  return `${slugify(name)}.png`;
 }
 
 /**

@@ -69,14 +69,17 @@ function extractSectionStyles(node: SceneNode): SectionStyles {
   };
   if (corners) {
     if (corners.uniform !== null) {
-      // uniform corners — agents apply via border-radius shorthand at element level;
-      // sections rarely have a single radius so we only emit per-corner when differing
+      styles.borderRadius = toCssValue(corners.uniform);
     } else {
       styles.borderTopLeftRadius = toCssValue(corners.topLeft);
       styles.borderTopRightRadius = toCssValue(corners.topRight);
       styles.borderBottomLeftRadius = toCssValue(corners.bottomLeft);
       styles.borderBottomRightRadius = toCssValue(corners.bottomRight);
     }
+  }
+  applyStrokes(styles, node);
+  if ('opacity' in node && typeof (node as any).opacity === 'number' && (node as any).opacity < 1) {
+    styles.opacity = Math.round((node as any).opacity * 100) / 100;
   }
   return styles;
 }
@@ -116,10 +119,10 @@ function extractPerCornerRadius(node: any): {
 }
 
 /**
- * Apply per-corner radius to an ElementStyles. If all 4 are equal, emit
- * borderRadius shorthand; otherwise emit the 4 explicit values.
+ * Apply per-corner radius. If all 4 are equal, emit borderRadius shorthand;
+ * otherwise emit the 4 explicit values. Works on ElementStyles or SectionStyles.
  */
-function applyRadius(elem: Partial<ElementStyles>, node: any): void {
+function applyRadius(elem: Partial<ElementStyles> & Partial<SectionStyles>, node: any): void {
   const corners = extractPerCornerRadius(node);
   if (!corners) return;
   if (corners.uniform !== null) {
@@ -133,11 +136,11 @@ function applyRadius(elem: Partial<ElementStyles>, node: any): void {
 }
 
 /**
- * Apply strokes to an ElementStyles: per-side border-width when Figma has
- * individualStrokeWeights, single borderWidth otherwise. Also maps style
- * (solid/dashed/dotted) and color.
+ * Apply strokes: per-side border-width when Figma has individualStrokeWeights,
+ * single borderWidth otherwise. Also maps style (solid/dashed/dotted) and
+ * color. Works on ElementStyles or SectionStyles.
  */
-function applyStrokes(elem: Partial<ElementStyles>, node: any): void {
+function applyStrokes(elem: Partial<ElementStyles> & Partial<SectionStyles>, node: any): void {
   const color = extractStrokeColor(node);
   const widths = extractBorderWidths(node);
   const style = extractBorderStyle(node);
@@ -461,6 +464,35 @@ function applyCommonSignals(elem: Partial<ElementStyles>, node: SceneNode): void
 }
 
 /**
+ * Read node.opacity and return it when below 1 (rounded to 2 decimals).
+ * Returns null for fully opaque nodes or when the property is absent.
+ */
+function extractOpacity(node: any): number | null {
+  if (!('opacity' in node) || typeof node.opacity !== 'number') return null;
+  if (node.opacity >= 1) return null;
+  return Math.round(node.opacity * 100) / 100;
+}
+
+/**
+ * Decide whether a non-text, non-image, non-button, non-input frame carries
+ * enough visual styling (fill, stroke, radius, shadow, reduced opacity) to
+ * warrant being emitted as a container element. Plain structural wrappers
+ * with no styling return false so we don't flood output with empty entries.
+ */
+function hasContainerStyling(node: SceneNode): boolean {
+  const n = node as any;
+  if (extractBackgroundColor(n)) return true;
+  if (extractGradient(n)) return true;
+  if (extractStrokeColor(n)) return true;
+  const corners = extractPerCornerRadius(n);
+  if (corners) return true;
+  const fx = extractEffects(n);
+  if (fx.boxShadow || fx.filter || fx.backdropFilter) return true;
+  if (extractOpacity(n) !== null) return true;
+  return false;
+}
+
+/**
  * Find and classify all meaningful elements within a section.
  * Walks the node tree and extracts typography for TEXT nodes,
  * dimensions for image containers, etc.
@@ -523,6 +555,9 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
 
       // Common signals: componentInstance, sizing modes, bound variables
       applyCommonSignals(typo, node);
+
+      const textOpacity = extractOpacity(node);
+      if (textOpacity !== null) typo.opacity = textOpacity;
 
       elements[role] = typo;
       textIndex++;
@@ -608,6 +643,8 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
       }
       // Flex-child props if image is inside an auto-layout row
       Object.assign(imgElem, extractFlexChildProps(node));
+      const imgOpacity = extractOpacity(node);
+      if (imgOpacity !== null) imgElem.opacity = imgOpacity;
       elements[finalRole] = imgElem;
       imageIndex++;
     }
@@ -657,6 +694,9 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
         // Common signals: componentInstance (button variants!), sizing, vars
         applyCommonSignals(buttonStyles, frame);
 
+        const btnOpacity = extractOpacity(frame);
+        if (btnOpacity !== null) buttonStyles.opacity = btnOpacity;
+
         const cleanName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
         elements[cleanName || 'button'] = buttonStyles;
       }
@@ -689,9 +729,66 @@ function extractElements(sectionNode: SceneNode): Record<string, Partial<Element
       }
       applyCommonSignals(inputStyles, frame);
 
+      const inputOpacity = extractOpacity(frame);
+      if (inputOpacity !== null) inputStyles.opacity = inputOpacity;
+
       const inputName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') || 'input';
       elements[inputName] = inputStyles;
       return; // Don't recurse into input internals
+    }
+
+    // Generic container frames — cards, wrappers, tiles etc. Emit styling when
+    // the frame has any visual properties (fill, stroke, radius, shadow,
+    // opacity < 1). Skip depth 0 (that's the section itself, handled by
+    // extractSectionStyles). Still recurse so nested text/images/buttons are
+    // captured as separate elements.
+    if (depth > 0 &&
+        (node.type === 'FRAME' || node.type === 'INSTANCE' || node.type === 'COMPONENT' || node.type === 'GROUP') &&
+        !hasImageFill(node as any) &&
+        hasContainerStyling(node)) {
+      const frame = node as FrameNode;
+      const containerStyles: Partial<ElementStyles> = {};
+
+      const bg = extractBackgroundColor(frame);
+      if (bg) containerStyles.backgroundColor = bg;
+      const gradient = extractGradient(frame);
+      if (gradient) containerStyles.backgroundGradient = gradient;
+
+      if (frame.layoutMode && frame.layoutMode !== 'NONE') {
+        containerStyles.paddingTop = toCssValue(frame.paddingTop);
+        containerStyles.paddingBottom = toCssValue(frame.paddingBottom);
+        containerStyles.paddingLeft = toCssValue(frame.paddingLeft);
+        containerStyles.paddingRight = toCssValue(frame.paddingRight);
+        if (typeof frame.itemSpacing === 'number' && frame.itemSpacing > 0) {
+          containerStyles.gap = toCssValue(frame.itemSpacing);
+        }
+      }
+
+      applyRadius(containerStyles, frame);
+      applyStrokes(containerStyles, frame);
+
+      const fx = extractEffects(frame as any);
+      if (fx.boxShadow) containerStyles.boxShadow = fx.boxShadow;
+      if (fx.filter) containerStyles.filter = fx.filter;
+      if (fx.backdropFilter) containerStyles.backdropFilter = fx.backdropFilter;
+
+      const tx = extractTransform(frame as any);
+      if (tx.transform) containerStyles.transform = tx.transform;
+
+      const containerOpacity = extractOpacity(frame);
+      if (containerOpacity !== null) containerStyles.opacity = containerOpacity;
+
+      Object.assign(containerStyles, extractFlexChildProps(frame as any));
+      applyCommonSignals(containerStyles, frame);
+
+      const cleanName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      const role = cleanName && !/^(frame|group|rectangle|ellipse)\d*$/.test(cleanName)
+        ? cleanName
+        : `container_${Object.keys(elements).filter(k => k.startsWith('container_')).length + 1}`;
+      if (!elements[role]) {
+        elements[role] = containerStyles;
+      }
+      // Fall through to recursion so nested elements still get extracted.
     }
 
     // Recurse into children (depth limit 6 to capture deeply nested elements)
@@ -1230,7 +1327,7 @@ export function parseSections(pageFrame: FrameNode, globalNames?: Set<string>): 
     specs[layoutName] = {
       spacingSource,
       figmaNodeId: node.id,
-      screenshotFile: `screenshots/${screenshotFilename(i + 1, node.name)}`,
+      screenshotFile: `screenshots/${screenshotFilename(node.name)}`,
       section: mergedStyles,
       elements,
       grid,

@@ -167,10 +167,20 @@ export interface SectionStyles {
   boxShadow?: string | null;
   filter?: string | null;
   backdropFilter?: string | null;
+  /** Uniform border-radius shorthand (preferred when all 4 corners equal) */
+  borderRadius?: string | null;
   borderTopLeftRadius?: string | null;
   borderTopRightRadius?: string | null;
   borderBottomLeftRadius?: string | null;
   borderBottomRightRadius?: string | null;
+  borderWidth?: string | null;
+  borderTopWidth?: string | null;
+  borderRightWidth?: string | null;
+  borderBottomWidth?: string | null;
+  borderLeftWidth?: string | null;
+  borderColor?: string | null;
+  borderStyle?: string | null;
+  opacity?: number | null;
 }
 
 export interface ElementStyles {
