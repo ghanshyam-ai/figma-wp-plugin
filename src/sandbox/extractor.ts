@@ -1,7 +1,7 @@
 import {
   SectionSpecs, DesignTokens, ExportManifest, ExportManifestPage,
   ResponsivePair, ResponsiveMap, PageTokens, ImageMap, FontTokenInfo,
-  ResponsiveOverride, SectionSpec,
+  ResponsiveOverride, SectionSpec, FailedExport,
 } from './types';
 import { slugify, toLayoutName } from './utils';
 import { collectColors } from './color';
@@ -12,6 +12,7 @@ import { matchResponsiveFrames } from './responsive';
 import { buildExportTasks, executeBatchExport, buildImageMap } from './image-exporter';
 import { extractVariables } from './variables';
 import { normalizeSectionName } from './patterns';
+import { buildIconFilenameMap } from './icon-detector';
 
 /**
  * Master extraction orchestrator.
@@ -27,6 +28,7 @@ export async function runExtraction(
   const allDesignTokenFonts: Record<string, FontTokenInfo> = {};
   const allSpacingValues = new Set<number>();
   const manifestPages: ExportManifestPage[] = [];
+  const allFailedExports: FailedExport[] = [];
   let totalSections = 0;
   let totalImages = 0;
 
@@ -50,8 +52,14 @@ export async function runExtraction(
       label: `Extracting "${pair.pageName}"...`,
     });
 
+    // ── Build the icon filename map FIRST so section-parser and the
+    //    image-exporter agree on which nodes are icons and what filenames
+    //    they receive. This is the linchpin that prevents
+    //    "section-spec references X.svg but X.svg doesn't exist". ──
+    const iconMap = buildIconFilenameMap(desktopFrame);
+
     // ── Parse sections from desktop frame ──
-    const sections = parseSections(desktopFrame, globalNames);
+    const sections = parseSections(desktopFrame, iconMap, globalNames);
     const sectionCount = Object.keys(sections).length;
     totalSections += sectionCount;
 
@@ -60,21 +68,11 @@ export async function runExtraction(
       const mobileNode = figma.getNodeById(pair.mobile.frameId);
       if (mobileNode && mobileNode.type === 'FRAME') {
         const mobileFrame = mobileNode as FrameNode;
-        const mobileSections = parseSections(mobileFrame, globalNames);
+        const mobileIconMap = buildIconFilenameMap(mobileFrame);
+        const mobileSections = parseSections(mobileFrame, mobileIconMap, globalNames);
         mergeResponsiveData(sections, mobileSections, pair.mobile.width);
       }
     }
-
-    // ── Build section-specs.json ──
-    const sectionSpecs: SectionSpecs = {
-      figma_canvas_width: Math.round(desktopFrame.width),
-      figma_canvas_height: Math.round(desktopFrame.height),
-      mobile_canvas_width: pair.mobile?.width,
-      page_slug: pair.pageSlug,
-      extracted_at: new Date().toISOString(),
-      extraction_method: 'plugin',
-      sections,
-    };
 
     // ── Collect tokens for this page ──
     const colors = collectColors(desktopFrame);
@@ -113,24 +111,12 @@ export async function runExtraction(
       allSpacingValues.add(s.value);
     }
 
-    // ── Generate spec.md ──
-    const specMd = generateSpecMd(pair.pageName, pair.pageSlug, sectionSpecs, pageTokens);
-
-    // ── Send page data to UI ──
-    sendMessage({
-      type: 'PAGE_DATA',
-      pageSlug: pair.pageSlug,
-      sectionSpecs,
-      specMd,
-      tokens: pageTokens,
-    });
-
     // ── Export images and screenshots ──
-    const exportTasks = buildExportTasks(desktopFrame, pair.pageSlug);
+    const exportTasks = buildExportTasks(desktopFrame, pair.pageSlug, iconMap);
     const assetCount = exportTasks.filter(t => t.type === 'asset').length;
     totalImages += assetCount;
 
-    await executeBatchExport(
+    const pageFailures = await executeBatchExport(
       exportTasks,
       (current, total, label) => {
         sendMessage({ type: 'EXPORT_PROGRESS', current, total, label });
@@ -154,12 +140,50 @@ export async function runExtraction(
       },
       shouldCancel,
     );
+    allFailedExports.push(...pageFailures);
+
+    // ── Patch iconFile references for failed/fallback SVG exports.
+    //    If SVG export failed but PNG fallback succeeded, redirect
+    //    iconFile to the .png. If both failed, drop iconFile (alt text
+    //    still survives so the agent has a textual cue). ──
+    if (pageFailures.length > 0) {
+      const fallbackMap = new Map<string, string>();
+      const droppedSet = new Set<string>();
+      for (const f of pageFailures) {
+        if (f.fallbackFilename) fallbackMap.set(f.filename, f.fallbackFilename);
+        else droppedSet.add(f.filename);
+      }
+      patchIconReferences(sections, fallbackMap, droppedSet);
+    }
+
+    // ── Build section-specs.json (now with patched iconFile refs) ──
+    const sectionSpecs: SectionSpecs = {
+      figma_canvas_width: Math.round(desktopFrame.width),
+      figma_canvas_height: Math.round(desktopFrame.height),
+      mobile_canvas_width: pair.mobile?.width,
+      page_slug: pair.pageSlug,
+      extracted_at: new Date().toISOString(),
+      extraction_method: 'plugin',
+      sections,
+    };
+
+    // ── Generate spec.md AFTER patches so it matches section-specs ──
+    const specMd = generateSpecMd(pair.pageName, pair.pageSlug, sectionSpecs, pageTokens);
+
+    // ── Send page data to UI (post-export so iconFile refs are accurate) ──
+    sendMessage({
+      type: 'PAGE_DATA',
+      pageSlug: pair.pageSlug,
+      sectionSpecs,
+      specMd,
+      tokens: pageTokens,
+    });
 
     // ── Build and send image map ──
     const sectionChildren = desktopFrame.children
       .filter(c => c.visible !== false)
       .map(c => ({ name: c.name, children: 'children' in c ? [...(c as FrameNode).children] : [] }));
-    const imageMap = buildImageMap(exportTasks, sectionChildren);
+    const imageMap = buildImageMap(exportTasks, sectionChildren, iconMap);
     sendMessage({
       type: 'IMAGE_MAP_DATA',
       path: `pages/${pair.pageSlug}/images`,
@@ -200,6 +224,7 @@ export async function runExtraction(
       fontCount: Object.keys(allDesignTokenFonts).length,
       spacingValues: allSpacingValues.size,
     },
+    failedExports: allFailedExports.length > 0 ? allFailedExports : undefined,
   };
 
   // Figma Variables (authoritative token names when available)
@@ -444,6 +469,32 @@ function collectImageFileNames(node: SceneNode): string[] {
   }
   walk(node);
   return names;
+}
+
+/**
+ * Walk every element in the section map and reconcile `iconFile` against
+ * the post-export reality:
+ *   - If the .svg fell back to .png, rewrite iconFile to the .png filename.
+ *   - If the export failed entirely with no fallback, drop iconFile so the
+ *     agent doesn't reference a non-existent asset (alt text still
+ *     survives as a textual cue).
+ */
+function patchIconReferences(
+  sections: Record<string, SectionSpec>,
+  fallbackMap: Map<string, string>,
+  droppedSet: Set<string>,
+): void {
+  for (const spec of Object.values(sections)) {
+    for (const elem of Object.values(spec.elements)) {
+      const f = (elem as any).iconFile as string | null | undefined;
+      if (!f) continue;
+      if (fallbackMap.has(f)) {
+        (elem as any).iconFile = fallbackMap.get(f);
+      } else if (droppedSet.has(f)) {
+        delete (elem as any).iconFile;
+      }
+    }
+  }
 }
 
 /**

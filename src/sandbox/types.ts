@@ -281,6 +281,10 @@ export interface ElementStyles {
    *  is a component instance, otherwise a humanized layer name. Empty when
    *  the source is a default Figma-generated name. */
   alt?: string | null;
+  /** SVG filename for icon-like elements (vector-only, exported as SVG).
+   *  Resolves relative to the page's images/ directory — the agent should
+   *  inline this asset rather than treat it as a raster image. */
+  iconFile?: string | null;
   /** Component instance metadata — present when the node is a Figma INSTANCE.
    *  Lets the agent deduplicate repeated instances into a shared ACF block/pattern. */
   componentInstance?: ComponentInstanceInfo | null;
@@ -333,8 +337,8 @@ export interface ResponsiveOverride {
 export interface LayerInfo {
   /** Element name (matches key in elements Record) */
   name: string;
-  /** Semantic role: text, image, background_image, button, container, shape */
-  role: 'text' | 'image' | 'background_image' | 'button' | 'container' | 'shape';
+  /** Semantic role: text, image, background_image, button, container, shape, icon */
+  role: 'text' | 'image' | 'background_image' | 'button' | 'container' | 'shape' | 'icon';
   /** Figma node type */
   type: string;
   /** Bounding box relative to section origin (not absolute canvas) */
@@ -472,6 +476,21 @@ export interface ExportManifest {
     fontCount: number;
     spacingValues: number;
   };
+  /** Image/icon export tasks that failed during the run. The agent should
+   *  treat any element referencing one of these filenames as missing and
+   *  fall back to its alt text or a generic placeholder. Empty when every
+   *  asset exported successfully. */
+  failedExports?: FailedExport[];
+}
+
+export interface FailedExport {
+  filename: string;
+  nodeName: string;
+  reason: string;
+  /** When set, this asset was retried in a different format and saved
+   *  under `fallbackFilename`. Element references to `filename` should
+   *  be redirected to `fallbackFilename` (extractor handles this). */
+  fallbackFilename?: string;
 }
 
 export interface ExportManifestPage {

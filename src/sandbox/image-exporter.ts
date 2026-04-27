@@ -1,4 +1,4 @@
-import { ImageExportTask, ImageMap, ImageMapEntry } from './types';
+import { ImageExportTask, ImageMap, ImageMapEntry, FailedExport } from './types';
 import { slugify, screenshotFilename } from './utils';
 import { hasImageFill } from './color';
 
@@ -37,8 +37,17 @@ function identifySectionNodes(pageFrame: FrameNode): SceneNode[] {
  * Build the list of all export tasks for a page frame.
  * Includes: full-page composite screenshot, per-section screenshots,
  * and image assets (PNG for photos, SVG for vector icons).
+ *
+ * `iconMap` (from icon-detector) decides which nodes become SVG icons and
+ * what filename each one gets. Both this function and section-parser
+ * consume the same map so the JSON specs reference exactly the files we
+ * export.
  */
-export function buildExportTasks(pageFrame: FrameNode, pageSlug: string): ImageExportTask[] {
+export function buildExportTasks(
+  pageFrame: FrameNode,
+  pageSlug: string,
+  iconMap: Map<string, string>,
+): ImageExportTask[] {
   const tasks: ImageExportTask[] = [];
   const pagePath = `pages/${pageSlug}`;
 
@@ -68,17 +77,23 @@ export function buildExportTasks(pageFrame: FrameNode, pageSlug: string): ImageE
     });
   }
 
-  // Image assets — detect icons (vector-only, small) vs photos (raster fills)
-  const iconNodes = findIconNodes(pageFrame);
-  const seenIconIds = new Set<string>();
-  for (const iconNode of iconNodes) {
-    if (seenIconIds.has(iconNode.id)) continue;
-    seenIconIds.add(iconNode.id);
+  // Icon SVG tasks — one per unique filename. Multiple instances of the
+  // same library icon collapse to a single export (handled by icon-detector).
+  const filenameToFirstNodeId = new Map<string, string>();
+  for (const [nodeId, filename] of iconMap) {
+    if (!filenameToFirstNodeId.has(filename)) {
+      filenameToFirstNodeId.set(filename, nodeId);
+    }
+  }
+  const iconRootIds = new Set(iconMap.keys());
+  for (const [filename, nodeId] of filenameToFirstNodeId) {
+    const node = figma.getNodeById(nodeId);
+    if (!node) continue;
     tasks.push({
-      nodeId: iconNode.id,
-      nodeName: iconNode.name,
+      nodeId,
+      nodeName: (node as SceneNode).name,
       type: 'asset',
-      filename: `${slugify(iconNode.name)}.svg`,
+      filename,
       pagePath,
       format: 'SVG',
       scale: 1,
@@ -86,12 +101,14 @@ export function buildExportTasks(pageFrame: FrameNode, pageSlug: string): ImageE
     });
   }
 
+  // Raster image tasks — skip anything inside an icon root (descendant
+  // vectors don't need their own export).
   const imageNodes = findImageNodes(pageFrame);
   const seenHashes = new Set<string>();
 
   for (const imgNode of imageNodes) {
-    // Skip nodes already queued as SVG icons
-    if (seenIconIds.has(imgNode.id)) continue;
+    if (iconRootIds.has(imgNode.id)) continue;
+    if (isInsideIconRoot(imgNode, iconRootIds)) continue;
     const hashKey = `${imgNode.name}_${imgNode.absoluteBoundingBox?.width}_${imgNode.absoluteBoundingBox?.height}`;
     if (seenHashes.has(hashKey)) continue;
     seenHashes.add(hashKey);
@@ -112,58 +129,16 @@ export function buildExportTasks(pageFrame: FrameNode, pageSlug: string): ImageE
 }
 
 /**
- * Identify icon nodes — vector-only, typically small (< 64px). These are
- * exported as SVG so the theme can inline them, recolor via CSS currentColor,
- * and render sharp at any resolution.
- *
- * Heuristics:
- *   - node.type === 'VECTOR' (pure vector path)
- *   - FRAME/COMPONENT whose entire subtree is vector (no IMAGE fills, no TEXT)
- *     AND bounding box ≤ 64×64
- *   - Layer name contains "icon" (hint)
+ * Walk a node's ancestry checking whether any ancestor is an icon root.
+ * Used to suppress duplicate exports for vectors inside an icon group.
  */
-function findIconNodes(root: SceneNode): SceneNode[] {
-  const icons: SceneNode[] = [];
-
-  function isVectorOnly(n: SceneNode): boolean {
-    if (n.type === 'TEXT') return false;
-    if (hasImageFill(n as any)) return false;
-    if ('children' in n) {
-      for (const child of (n as FrameNode).children) {
-        if (child.visible === false) continue;
-        if (!isVectorOnly(child)) return false;
-      }
-    }
-    return true;
+function isInsideIconRoot(node: SceneNode, iconRootIds: Set<string>): boolean {
+  let p: BaseNode | null = node.parent;
+  while (p) {
+    if ('id' in p && iconRootIds.has((p as any).id)) return true;
+    p = (p as any).parent;
   }
-
-  function walk(node: SceneNode) {
-    if (node.visible === false) return;
-    const bb = node.absoluteBoundingBox;
-    const smallish = bb && bb.width <= 64 && bb.height <= 64;
-
-    if (node.type === 'VECTOR') {
-      icons.push(node);
-      return; // don't recurse into vector paths
-    }
-
-    const nameHintsIcon = /\bicon\b/i.test(node.name);
-    if ((node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE' || node.type === 'GROUP') &&
-        (smallish || nameHintsIcon) &&
-        isVectorOnly(node) &&
-        'children' in node && (node as FrameNode).children.length > 0) {
-      icons.push(node);
-      return; // don't recurse into icon internals
-    }
-
-    if ('children' in node) {
-      for (const child of (node as FrameNode).children) {
-        walk(child);
-      }
-    }
-  }
-  walk(root);
-  return icons;
+  return false;
 }
 
 /**
@@ -263,17 +238,23 @@ async function tryExtractRawImageBytes(node: SceneNode): Promise<Uint8Array | nu
 /**
  * Execute export tasks in batches of 10.
  * Sends each result to UI immediately to free sandbox memory.
+ *
+ * On SVG export failure (some Figma vector features can't serialize),
+ * automatically retries as PNG @ 2x and emits the .png filename instead.
+ * Both the original failure and the fallback are recorded in the returned
+ * `failed` list so the extractor can patch element references.
  */
 export async function executeBatchExport(
   tasks: ImageExportTask[],
   onProgress: (current: number, total: number, label: string) => void,
   onData: (task: ImageExportTask, data: Uint8Array) => void,
   shouldCancel: () => boolean,
-): Promise<void> {
+): Promise<FailedExport[]> {
   const total = tasks.length;
+  const failed: FailedExport[] = [];
 
   for (let i = 0; i < total; i += BATCH_SIZE) {
-    if (shouldCancel()) return;
+    if (shouldCancel()) return failed;
 
     const batch = tasks.slice(i, i + BATCH_SIZE);
     const batchPromises = batch.map(async (task) => {
@@ -281,7 +262,46 @@ export async function executeBatchExport(
         const data = await exportNode(task.nodeId, task.format, task.scale, task.type);
         onData(task, data);
       } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+
+        // SVG can fail for vectors with unsupported features (open paths
+        // with stroke caps, certain blend modes, bound variables on fills).
+        // Fall back to PNG @ 2x so the design isn't visually missing.
+        if (task.format === 'SVG') {
+          const pngFilename = task.filename.replace(/\.svg$/i, '.png');
+          const pngTask: ImageExportTask = {
+            ...task,
+            filename: pngFilename,
+            format: 'PNG',
+            scale: 2,
+          };
+          try {
+            const data = await exportNode(task.nodeId, 'PNG', 2, task.type);
+            onData(pngTask, data);
+            failed.push({
+              filename: task.filename,
+              nodeName: task.nodeName,
+              reason: `SVG export failed (${reason}); fell back to PNG`,
+              fallbackFilename: pngFilename,
+            });
+            return;
+          } catch (pngErr) {
+            const pngReason = pngErr instanceof Error ? pngErr.message : String(pngErr);
+            failed.push({
+              filename: task.filename,
+              nodeName: task.nodeName,
+              reason: `SVG and PNG fallback both failed: ${reason} / ${pngReason}`,
+            });
+            return;
+          }
+        }
+
         console.error(`Failed to export ${task.filename}:`, err);
+        failed.push({
+          filename: task.filename,
+          nodeName: task.nodeName,
+          reason,
+        });
       }
     });
 
@@ -289,14 +309,21 @@ export async function executeBatchExport(
     const done = Math.min(i + BATCH_SIZE, total);
     onProgress(done, total, `Exporting (${done}/${total})...`);
   }
+
+  return failed;
 }
 
 /**
  * Build the image-map.json from export tasks and section data.
+ *
+ * `iconMap` populates `by_section` for icon usage so the agent can trace
+ * "section X uses chevron-right.svg" instead of getting a context-less
+ * global list of SVGs.
  */
 export function buildImageMap(
   tasks: ImageExportTask[],
-  sections: { name: string; children: SceneNode[] }[]
+  sections: { name: string; children: SceneNode[] }[],
+  iconMap: Map<string, string>,
 ): ImageMap {
   const images: Record<string, ImageMapEntry> = {};
   const bySectionMap: Record<string, string[]> = {};
@@ -315,25 +342,38 @@ export function buildImageMap(
   }
 
   for (const section of sections) {
-    const sectionImages: string[] = [];
+    const sectionImages = new Set<string>();
+
     function walk(node: SceneNode) {
+      // Icon root — record SVG and stop (don't descend into vector internals)
+      const iconFilename = iconMap.get(node.id);
+      if (iconFilename) {
+        sectionImages.add(iconFilename);
+        if (images[iconFilename] && !images[iconFilename].usedInSections.includes(section.name)) {
+          images[iconFilename].usedInSections.push(section.name);
+        }
+        return;
+      }
+
       if (hasImageFill(node as any)) {
         const filename = `${slugify(node.name)}.png`;
-        sectionImages.push(filename);
-        if (images[filename]) {
+        sectionImages.add(filename);
+        if (images[filename] && !images[filename].usedInSections.includes(section.name)) {
           images[filename].usedInSections.push(section.name);
         }
       }
+
       if ('children' in node) {
         for (const child of (node as FrameNode).children) {
           walk(child);
         }
       }
     }
+
     for (const child of section.children) {
       walk(child);
     }
-    bySectionMap[section.name] = sectionImages;
+    bySectionMap[section.name] = [...sectionImages];
   }
 
   return { images, by_section: bySectionMap };

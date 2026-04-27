@@ -11,6 +11,7 @@ import {
   detectRepeaters, detectComponentPatterns, detectNavigation,
   inferSectionType, normalizeSectionName, classifyGlobalRole,
 } from './patterns';
+import { rgbToHex } from './color';
 
 /**
  * Identify section frames within a page frame.
@@ -493,16 +494,88 @@ function hasContainerStyling(node: SceneNode): boolean {
 }
 
 /**
+ * Walk an icon subtree to find its primary SOLID fill color. Used to
+ * suggest a CSS color for the inlined SVG (the agent can override with
+ * `currentColor` if it wants the icon to inherit). Returns null when no
+ * solid fill is found.
+ */
+function findFirstSolidFillColor(node: SceneNode): string | null {
+  const fills = (node as any).fills;
+  if (Array.isArray(fills)) {
+    for (const f of fills) {
+      if (f && f.type === 'SOLID' && f.visible !== false && f.color) {
+        return rgbToHex(f.color);
+      }
+    }
+  }
+  if ('children' in node) {
+    for (const child of (node as FrameNode).children) {
+      if (child.visible === false) continue;
+      const c = findFirstSolidFillColor(child);
+      if (c) return c;
+    }
+  }
+  return null;
+}
+
+/**
+ * Build an element entry for an icon node. Encodes the SVG filename so
+ * the agent knows which file to inline, plus dimensions, alt text, and
+ * a suggested fill color.
+ */
+function buildIconElement(node: SceneNode, filename: string): Partial<ElementStyles> {
+  const bb = node.absoluteBoundingBox;
+  const elem: Partial<ElementStyles> = {
+    iconFile: filename,
+    width: bb ? toCssValue(Math.round(bb.width)) : null,
+    height: bb ? toCssValue(Math.round(bb.height)) : null,
+  };
+  const color = findFirstSolidFillColor(node);
+  if (color) elem.color = color;
+  const alt = extractAltText(node);
+  if (alt) elem.alt = alt;
+  Object.assign(elem, extractFlexChildProps(node as any));
+  applyCommonSignals(elem, node);
+  const op = extractOpacity(node);
+  if (op !== null) elem.opacity = op;
+  const tx = extractTransform(node as any);
+  if (tx.transform) elem.transform = tx.transform;
+  const href = extractLinkUrl(node as any);
+  if (href) elem.linkUrl = href;
+  return elem;
+}
+
+/**
  * Find and classify all meaningful elements within a section.
  * Walks the node tree and extracts typography for TEXT nodes,
  * dimensions for image containers, etc.
  */
-function extractElements(sectionNode: SceneNode): Record<string, Partial<ElementStyles>> {
+function extractElements(
+  sectionNode: SceneNode,
+  iconMap: Map<string, string>,
+): Record<string, Partial<ElementStyles>> {
   const elements: Record<string, Partial<ElementStyles>> = {};
   let textIndex = 0;
   let imageIndex = 0;
+  let iconIndex = 0;
 
   function walk(node: SceneNode, depth: number) {
+    // Icon roots → emit iconFile reference and stop. iconMap is built by
+    // icon-detector and shared with image-exporter, so the filename here
+    // matches exactly what gets written into pages/<slug>/images/.
+    const iconFilename = iconMap.get(node.id);
+    if (iconFilename) {
+      const cleanName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      const role = cleanName && !/^(vector|icon|frame|group|rectangle|ellipse|boolean)\d*$/.test(cleanName)
+        ? cleanName
+        : `icon${iconIndex > 0 ? '_' + iconIndex : ''}`;
+      if (!elements[role]) {
+        elements[role] = buildIconElement(node, iconFilename);
+      }
+      iconIndex++;
+      return; // don't descend into the icon's vector children
+    }
+
     // TEXT nodes → typography + text content
     if (node.type === 'TEXT') {
       const typo = extractTypography(node);
@@ -824,7 +897,11 @@ function findFirstTextNode(node: SceneNode): TextNode | null {
  * Returns layers sorted by Figma's layer order (back to front).
  * Bounds are relative to the section's origin, not the canvas.
  */
-function extractLayers(sectionNode: SceneNode, elements: Record<string, Partial<ElementStyles>>): LayerInfo[] {
+function extractLayers(
+  sectionNode: SceneNode,
+  elements: Record<string, Partial<ElementStyles>>,
+  iconMap: Map<string, string>,
+): LayerInfo[] {
   const layers: LayerInfo[] = [];
   const sectionBounds = sectionNode.absoluteBoundingBox;
   if (!sectionBounds) return layers;
@@ -845,7 +922,13 @@ function extractLayers(sectionNode: SceneNode, elements: Record<string, Partial<
     let role: LayerInfo['role'] | null = null;
     let name = '';
 
-    if (node.type === 'TEXT') {
+    if (iconMap.has(node.id)) {
+      role = 'icon';
+      const cleanName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+      name = cleanName && !/^(vector|icon|frame|group|rectangle|ellipse|boolean)\d*$/.test(cleanName)
+        ? cleanName
+        : `icon_${layerIndex}`;
+    } else if (node.type === 'TEXT') {
       role = 'text';
       const cleanName = node.name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
       name = cleanName && !/^text\d*$/.test(cleanName) ? cleanName : `text_${layerIndex}`;
@@ -875,8 +958,9 @@ function extractLayers(sectionNode: SceneNode, elements: Record<string, Partial<
       layerIndex++;
     }
 
-    // Recurse (skip button internals)
-    if (role !== 'button' && 'children' in node && depth < 6) {
+    // Recurse (skip button and icon internals — icon children are vector
+    // paths that already exported as one composed SVG)
+    if (role !== 'button' && role !== 'icon' && 'children' in node && depth < 6) {
       for (const child of (node as FrameNode).children) {
         if (child.visible !== false) {
           walk(child, depth + 1);
@@ -1156,12 +1240,19 @@ function extractTextContentInOrder(sectionNode: SceneNode): TextContentEntry[] {
  * Parse sections from a page frame.
  *
  * @param pageFrame The top-level page frame to walk.
+ * @param iconMap Map<nodeId, svgFilename> from icon-detector. Section
+ *                elements that match an icon root receive an `iconFile`
+ *                pointing at the same filename image-exporter writes.
  * @param globalNames Optional set of normalized section names that appear on
  *                    ≥2 selected pages. When provided, matching sections are
  *                    marked `isGlobal: true` so the agent can promote them to
  *                    shared WP theme parts instead of duplicating per-page.
  */
-export function parseSections(pageFrame: FrameNode, globalNames?: Set<string>): Record<string, SectionSpec> {
+export function parseSections(
+  pageFrame: FrameNode,
+  iconMap: Map<string, string>,
+  globalNames?: Set<string>,
+): Record<string, SectionSpec> {
   const sectionNodes = identifySections(pageFrame);
   const specs: Record<string, SectionSpec> = {};
 
@@ -1206,7 +1297,7 @@ export function parseSections(pageFrame: FrameNode, globalNames?: Set<string>): 
     };
 
     // Elements
-    const elements = extractElements(node);
+    const elements = extractElements(node, iconMap);
 
     // Grid detection
     const grid = frame ? detectGrid(frame) : {
@@ -1241,7 +1332,7 @@ export function parseSections(pageFrame: FrameNode, globalNames?: Set<string>): 
     const interactions = extractInteractions(node);
 
     // Layer composition analysis
-    const layers = extractLayers(node, elements);
+    const layers = extractLayers(node, elements, iconMap);
     const composition = detectComposition(layers);
 
     // Enrich elements with position data from composition
