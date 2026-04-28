@@ -579,6 +579,9 @@ export interface ValidationResult {
   nodeId?: string;
   nodeName?: string;
   suggestion?: string;
+  /** Multi-step fix instructions shown in the "How to fix" panel.
+   *  Each line is rendered as a separate bullet. Use plain text — no Markdown. */
+  fixHint?: string[];
 }
 
 // ─────────────────────────────────────────────
@@ -621,7 +624,8 @@ export type UIToSandboxMessage =
   | { type: 'DISCOVER_PAGES' }
   | { type: 'VALIDATE'; frameIds: string[] }
   | { type: 'START_EXPORT'; frameIds: string[]; responsivePairs: ResponsivePair[] }
-  | { type: 'CANCEL_EXPORT' };
+  | { type: 'CANCEL_EXPORT' }
+  | { type: 'FOCUS_NODE'; nodeId: string };
 
 // Sandbox → UI
 export type SandboxToUIMessage =

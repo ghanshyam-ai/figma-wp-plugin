@@ -70,5 +70,35 @@ figma.ui.onmessage = async (msg: UIToSandboxMessage) => {
       console.log("Export cancelled by user");
       break;
     }
+
+    case 'FOCUS_NODE': {
+      // Jump the Figma canvas to the offending layer and select it. Used by
+      // the validation report's "click to locate" affordance — instant
+      // feedback so users see exactly where the issue lives in the design.
+      try {
+        const node = figma.getNodeById(msg.nodeId);
+        if (!node) {
+          console.warn('FOCUS_NODE: node not found', msg.nodeId);
+          break;
+        }
+        if ('parent' in node && node.parent && 'type' in node.parent) {
+          // Switch to the page containing the node before scrolling
+          let pageNode: BaseNode | null = node.parent;
+          while (pageNode && pageNode.type !== 'PAGE') {
+            pageNode = (pageNode as any).parent;
+          }
+          if (pageNode && pageNode.type === 'PAGE' && figma.currentPage.id !== pageNode.id) {
+            figma.currentPage = pageNode as PageNode;
+          }
+        }
+        if ('id' in node && node.type !== 'DOCUMENT' && node.type !== 'PAGE') {
+          figma.currentPage.selection = [node as SceneNode];
+          figma.viewport.scrollAndZoomIntoView([node as SceneNode]);
+        }
+      } catch (err) {
+        console.warn('FOCUS_NODE failed:', err);
+      }
+      break;
+    }
   }
 };

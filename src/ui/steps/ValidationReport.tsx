@@ -1,7 +1,6 @@
 import { h } from 'preact';
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useMemo, useCallback } from 'preact/hooks';
 import { ValidationItem } from '../components/ValidationItem';
-import { Badge } from '../components/Badge';
 import { sendToPlugin, usePluginMessages } from '../hooks/usePluginMessages';
 
 interface ValidationResult {
@@ -12,6 +11,7 @@ interface ValidationResult {
   nodeId?: string;
   nodeName?: string;
   suggestion?: string;
+  fixHint?: string[];
 }
 
 interface ValidationReportProps {
@@ -20,9 +20,16 @@ interface ValidationReportProps {
   onBack: () => void;
 }
 
+type Severity = 'error' | 'warning' | 'info';
+
 export function ValidationReport({ frameIds, onExport, onBack }: ValidationReportProps) {
   const [results, setResults] = useState<ValidationResult[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Severity-filter state. All three start enabled — user opts out, not in.
+  const [showErrors, setShowErrors] = useState(true);
+  const [showWarnings, setShowWarnings] = useState(true);
+  const [showInfo, setShowInfo] = useState(true);
 
   useEffect(() => {
     sendToPlugin({ type: 'VALIDATE', frameIds });
@@ -35,10 +42,26 @@ export function ValidationReport({ frameIds, onExport, onBack }: ValidationRepor
     }
   });
 
-  const errors = results.filter(r => r.severity === 'error');
-  const warnings = results.filter(r => r.severity === 'warning');
-  const infos = results.filter(r => r.severity === 'info');
+  // Click-to-locate: ask the sandbox to scroll-and-zoom-into-view the node.
+  const handleFocusNode = useCallback((nodeId: string) => {
+    sendToPlugin({ type: 'FOCUS_NODE', nodeId });
+  }, []);
+
+  const errors = useMemo(() => results.filter(r => r.severity === 'error'), [results]);
+  const warnings = useMemo(() => results.filter(r => r.severity === 'warning'), [results]);
+  const infos = useMemo(() => results.filter(r => r.severity === 'info'), [results]);
   const hasErrors = errors.length > 0;
+
+  // Apply severity filters. We render a flat list (no per-severity headers)
+  // when filters are active, since the user's mental model is "show me only X".
+  const visibleResults = useMemo(() => {
+    return results.filter(r => {
+      if (r.severity === 'error') return showErrors;
+      if (r.severity === 'warning') return showWarnings;
+      if (r.severity === 'info') return showInfo;
+      return true;
+    });
+  }, [results, showErrors, showWarnings, showInfo]);
 
   if (loading) {
     return (
@@ -55,52 +78,63 @@ export function ValidationReport({ frameIds, onExport, onBack }: ValidationRepor
       {/* Header */}
       <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--figma-color-border, #E5E5E5)' }}>
         <h2 style={{ margin: 0, fontSize: '16px', fontWeight: '600' }}>Validation Report</h2>
-        <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
-          {errors.length > 0 && <Badge severity="error" count={errors.length} />}
-          {warnings.length > 0 && <Badge severity="warning" count={warnings.length} />}
-          {infos.length > 0 && <Badge severity="info" count={infos.length} />}
-          {results.length === 0 && (
+
+        {results.length === 0 ? (
+          <div style={{ marginTop: '8px' }}>
             <span style={{ fontSize: '13px', color: 'var(--figma-color-text-success, #14AE5C)' }}>
               All checks passed!
             </span>
-          )}
-        </div>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: '12px', marginTop: '10px', flexWrap: 'wrap' }}>
+            <SeverityToggle
+              severity="error"
+              count={errors.length}
+              checked={showErrors}
+              onChange={setShowErrors}
+              label="Errors"
+              color="#FF4D4D"
+            />
+            <SeverityToggle
+              severity="warning"
+              count={warnings.length}
+              checked={showWarnings}
+              onChange={setShowWarnings}
+              label="Warnings"
+              color="#FFB020"
+            />
+            <SeverityToggle
+              severity="info"
+              count={infos.length}
+              checked={showInfo}
+              onChange={setShowInfo}
+              label="Info"
+              color="#4D9AFF"
+            />
+          </div>
+        )}
       </div>
 
-      {/* Results */}
+      {/* Results (flat list, filter applied) */}
       <div style={{ flex: 1, overflow: 'auto', padding: '8px 16px' }}>
-        {hasErrors && (
-          <div style={{ marginBottom: '16px' }}>
-            <div style={{ fontSize: '12px', fontWeight: '600', color: '#FF4D4D', marginBottom: '6px' }}>
-              ERRORS (must fix before export)
-            </div>
-            {errors.map((r, i) => (
-              <ValidationItem key={`e-${i}`} {...r} />
-            ))}
+        {results.length > 0 && visibleResults.length === 0 && (
+          <div style={{
+            padding: '24px',
+            textAlign: 'center',
+            color: 'var(--figma-color-text-secondary, #999)',
+            fontSize: '13px',
+          }}>
+            No issues match the selected filters.
           </div>
         )}
 
-        {warnings.length > 0 && (
-          <div style={{ marginBottom: '16px' }}>
-            <div style={{ fontSize: '12px', fontWeight: '600', color: '#FFB020', marginBottom: '6px' }}>
-              WARNINGS (export allowed)
-            </div>
-            {warnings.map((r, i) => (
-              <ValidationItem key={`w-${i}`} {...r} />
-            ))}
-          </div>
-        )}
-
-        {infos.length > 0 && (
-          <div style={{ marginBottom: '16px' }}>
-            <div style={{ fontSize: '12px', fontWeight: '600', color: '#4D9AFF', marginBottom: '6px' }}>
-              INFO
-            </div>
-            {infos.map((r, i) => (
-              <ValidationItem key={`i-${i}`} {...r} />
-            ))}
-          </div>
-        )}
+        {visibleResults.map((r, i) => (
+          <ValidationItem
+            key={`${r.severity}-${r.check}-${i}-${r.nodeId || 'nonode'}`}
+            {...r}
+            onFocus={handleFocusNode}
+          />
+        ))}
       </div>
 
       {/* Footer */}
@@ -119,6 +153,52 @@ export function ValidationReport({ frameIds, onExport, onBack }: ValidationRepor
         </button>
       </div>
     </div>
+  );
+}
+
+interface SeverityToggleProps {
+  severity: Severity;
+  count: number;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+  color: string;
+}
+
+function SeverityToggle({ severity, count, checked, onChange, label, color }: SeverityToggleProps) {
+  const disabled = count === 0;
+  return (
+    <label style={{
+      display: 'flex',
+      alignItems: 'center',
+      gap: '6px',
+      cursor: disabled ? 'not-allowed' : 'pointer',
+      fontSize: '12px',
+      fontWeight: 500,
+      opacity: disabled ? 0.4 : 1,
+      userSelect: 'none',
+    }}>
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange((e.target as HTMLInputElement).checked)}
+        style={{ accentColor: color, cursor: disabled ? 'not-allowed' : 'pointer' }}
+      />
+      <span style={{ color }}>{label}</span>
+      <span style={{
+        background: color,
+        color: '#fff',
+        fontSize: '10px',
+        fontWeight: 700,
+        padding: '1px 6px',
+        borderRadius: '8px',
+        minWidth: '16px',
+        textAlign: 'center',
+      }}>
+        {count}
+      </span>
+    </label>
   );
 }
 

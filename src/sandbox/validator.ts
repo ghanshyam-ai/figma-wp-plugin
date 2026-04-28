@@ -61,6 +61,13 @@ function checkAutoLayout(sections: SceneNode[], frameName: string): ValidationRe
           nodeId: section.id,
           nodeName: section.name,
           suggestion: 'Apply auto-layout to this section for precise spacing extraction.',
+          fixHint: [
+            'Select the section frame in the Figma canvas.',
+            'Open the right panel → Auto layout → click the "+" icon.',
+            'Choose Vertical (most sections) or Horizontal direction.',
+            'Set padding (top/right/bottom/left) and gap to match the design intent.',
+            'Re-run validation — the warning should disappear.',
+          ],
         });
       }
     }
@@ -83,6 +90,13 @@ function checkLayerNames(sections: SceneNode[], frameName: string): ValidationRe
         nodeId: node.id,
         nodeName: node.name,
         suggestion: 'Rename to a descriptive name (e.g., "Hero Section", "Features Grid").',
+        fixHint: [
+          'Click the layer in the canvas — it will be selected automatically.',
+          'In the Layers panel (left), double-click the name and rename it.',
+          'Use semantic names: "Hero", "Features", "CTA", "Footer" for sections; "Heading", "Subheading", "Primary CTA" for elements.',
+          'Avoid generic names: Frame, Group, Rectangle, Vector, etc.',
+          'Good names become ACF layout keys downstream — they directly affect the WordPress output.',
+        ],
       });
     }
     if ('children' in node && depth < 2) {
@@ -134,6 +148,13 @@ async function checkFonts(frame: FrameNode): Promise<ValidationResult[]> {
         message: `Font "${family} ${style}" is not available. Text extraction may fail.`,
         sectionName: frame.name,
         suggestion: 'Install the font or replace it in the design.',
+        fixHint: [
+          `Install "${family}" in this style: ${style}.`,
+          'On macOS: open Font Book → File → Add Fonts → select the font file.',
+          'For Google Fonts: download from fonts.google.com and install locally, OR set up Figma\'s font sync via the desktop app.',
+          'Alternative: replace this font in the design with one that\'s already installed.',
+          'Restart Figma after installing — the font won\'t appear until then.',
+        ],
       });
     }
   }
@@ -172,6 +193,13 @@ function checkSpacingConsistency(frame: FrameNode): ValidationResult[] {
         message: `Near-duplicate spacing: ${unique[i]}px and ${unique[i + 1]}px — likely same intent?`,
         sectionName: frame.name,
         suggestion: `Consider standardizing to ${Math.round((unique[i] + unique[i + 1]) / 2)}px.`,
+        fixHint: [
+          `You have ${unique[i]}px and ${unique[i + 1]}px used as spacing — likely the same value off by 1-2px.`,
+          `Pick one value (suggested: ${Math.round((unique[i] + unique[i + 1]) / 2)}px) and apply it everywhere.`,
+          'Best practice: define a Figma Variable in a "Spacing" collection (e.g. spacing/md = 32) and bind padding/gap to it.',
+          'Variables propagate one rename across the whole file and become CSS custom properties in the export.',
+          'This is informational only — export will still work, but the WordPress theme will be tidier with consistent values.',
+        ],
       });
     }
   }
@@ -203,6 +231,13 @@ function checkOversizedImages(frame: FrameNode): ValidationResult[] {
                   nodeId: node.id,
                   nodeName: node.name,
                   suggestion: 'Consider reducing image dimensions or export scale.',
+                  fixHint: [
+                    `Image bounds: ${Math.round(bounds.width)}×${Math.round(bounds.height)}px — that\'s why it\'s heavy.`,
+                    'Replace the source image with a pre-compressed version (TinyPNG, ImageOptim, Squoosh).',
+                    'For background images, a 1920px or 2560px max width is usually enough — anything larger wastes bandwidth.',
+                    'If the image will be cropped at runtime, downscale BEFORE placing in Figma.',
+                    'After replacing, re-run validation — the warning should disappear.',
+                  ],
                 });
               }
             }
@@ -240,6 +275,13 @@ function checkOverlaps(sections: SceneNode[], frameName: string): ValidationResu
         sectionName: sorted[i].name,
         nodeId: sorted[i].id,
         suggestion: 'The plugin will record this as a negative margin. Verify the visual result.',
+        fixHint: [
+          `"${sorted[i].name}" extends ${Math.round(overlap)}px below where "${sorted[i + 1].name}" starts.`,
+          'If this is intentional (e.g. a card overlaps the next section by design), no action needed — the plugin emits a negative margin-top and z-index.',
+          'If unintentional, drag one of the sections so their bounding boxes don\'t overlap on the Y axis.',
+          'Tip: in Figma, holding Shift while dragging snaps to integer Y values.',
+          'After moving, re-run validation to confirm.',
+        ],
       });
     }
   }
@@ -263,6 +305,13 @@ function checkResponsiveFrames(frameIds: string[]): ValidationResult[] {
       check: 'responsive',
       message: `Only desktop frames selected (no mobile frames). Responsive values will be calculated, not extracted.`,
       suggestion: 'Include mobile (375px) frames for exact responsive values.',
+      fixHint: [
+        'Without a mobile frame, the plugin can only guess at how the design adapts below 768px.',
+        'Best practice: design at least one mobile frame (375px wide) per page.',
+        'Name it consistently with the desktop counterpart: e.g. "Home — Desktop" + "Home — Mobile" so the plugin can pair them automatically.',
+        'Then go back to Step 1 and select both frames before re-running validation.',
+        'You can export desktop-only — the agent will derive mobile from CSS-driven scaling — but extracted values are always more accurate than calculated ones.',
+      ],
     });
   }
   return results;
@@ -288,6 +337,13 @@ function checkTextOverflow(frame: FrameNode): ValidationResult[] {
             nodeId: node.id,
             nodeName: node.name,
             suggestion: 'Resize the text container or reduce text content.',
+            fixHint: [
+              'The text node\'s bounding box extends past its parent — content will be cut off in the export.',
+              'Option 1: Resize the parent frame so the text fits.',
+              'Option 2: Set the text\'s "Auto-resize" to "Width and Height" or "Height" so it grows with the content.',
+              'Option 3: Shorten the copy if it\'s placeholder text.',
+              'In auto-layout containers, also ensure the text\'s "Fill container" option matches the parent\'s direction.',
+            ],
           });
         }
       }
