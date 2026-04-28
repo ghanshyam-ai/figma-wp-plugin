@@ -34,19 +34,64 @@ function identifySectionNodes(pageFrame: FrameNode): SceneNode[] {
 }
 
 /**
+ * Build a Map<nodeId, filename> for every node with an IMAGE fill in the page.
+ *
+ * Dedup is by Figma's imageHash so two distinct photos that happen to share
+ * a layer name ("Image", "Rectangle 12") each get their own file, while
+ * multiple usages of the same bitmap collapse to a single export.
+ *
+ * Filename collisions (different bitmaps slugifying to the same base name)
+ * are resolved with a numeric suffix. Both image-exporter and section-parser
+ * consume this map so their references stay in lockstep.
+ */
+export function buildImageFilenameMap(
+  pageFrame: SceneNode,
+  iconRootIds: Set<string>,
+): Map<string, string> {
+  const result = new Map<string, string>();
+  const hashToFilename = new Map<string, string>();
+  const usedFilenames = new Set<string>();
+
+  for (const imgNode of findImageNodes(pageFrame)) {
+    if (iconRootIds.has(imgNode.id)) continue;
+    if (isInsideIconRoot(imgNode, iconRootIds)) continue;
+
+    const imageHash = getFirstImageHash(imgNode);
+    let filename: string | undefined;
+
+    if (imageHash && hashToFilename.has(imageHash)) {
+      filename = hashToFilename.get(imageHash)!;
+    } else {
+      const baseSlug = slugify(imgNode.name) || 'image';
+      filename = `${baseSlug}.png`;
+      let i = 2;
+      while (usedFilenames.has(filename)) {
+        filename = `${baseSlug}-${i++}.png`;
+      }
+      usedFilenames.add(filename);
+      if (imageHash) hashToFilename.set(imageHash, filename);
+    }
+
+    result.set(imgNode.id, filename);
+  }
+  return result;
+}
+
+/**
  * Build the list of all export tasks for a page frame.
  * Includes: full-page composite screenshot, per-section screenshots,
  * and image assets (PNG for photos, SVG for vector icons).
  *
  * `iconMap` (from icon-detector) decides which nodes become SVG icons and
- * what filename each one gets. Both this function and section-parser
- * consume the same map so the JSON specs reference exactly the files we
- * export.
+ * what filename each one gets. `imageMap` does the same for raster IMAGE
+ * fills. Both this function and section-parser consume the same maps so
+ * the JSON specs reference exactly the files we export.
  */
 export function buildExportTasks(
   pageFrame: FrameNode,
   pageSlug: string,
   iconMap: Map<string, string>,
+  imageMap: Map<string, string>,
 ): ImageExportTask[] {
   const tasks: ImageExportTask[] = [];
   const pagePath = `pages/${pageSlug}`;
@@ -101,22 +146,21 @@ export function buildExportTasks(
     });
   }
 
-  // Raster image tasks — skip anything inside an icon root (descendant
-  // vectors don't need their own export).
-  const imageNodes = findImageNodes(pageFrame);
-  const seenHashes = new Set<string>();
-
-  for (const imgNode of imageNodes) {
-    if (iconRootIds.has(imgNode.id)) continue;
-    if (isInsideIconRoot(imgNode, iconRootIds)) continue;
-    const hashKey = `${imgNode.name}_${imgNode.absoluteBoundingBox?.width}_${imgNode.absoluteBoundingBox?.height}`;
-    if (seenHashes.has(hashKey)) continue;
-    seenHashes.add(hashKey);
-
-    const filename = `${slugify(imgNode.name)}.png`;
+  // Raster image tasks — one task per unique filename in `imageMap`.
+  // The map already handles imageHash-based dedup and collision-suffixing;
+  // we just walk it and queue one export per output file.
+  const filenameToFirstImageNodeId = new Map<string, string>();
+  for (const [nodeId, filename] of imageMap) {
+    if (!filenameToFirstImageNodeId.has(filename)) {
+      filenameToFirstImageNodeId.set(filename, nodeId);
+    }
+  }
+  for (const [filename, nodeId] of filenameToFirstImageNodeId) {
+    const node = figma.getNodeById(nodeId);
+    if (!node) continue;
     tasks.push({
-      nodeId: imgNode.id,
-      nodeName: imgNode.name,
+      nodeId,
+      nodeName: (node as SceneNode).name,
       type: 'asset',
       filename,
       pagePath,
@@ -139,6 +183,22 @@ function isInsideIconRoot(node: SceneNode, iconRootIds: Set<string>): boolean {
     p = (p as any).parent;
   }
   return false;
+}
+
+/**
+ * Return the imageHash of the first visible IMAGE fill on a node, or null
+ * if the node has no resolvable IMAGE fill. Used to dedupe identical
+ * raster bitmaps across the page so we don't emit one file per usage.
+ */
+function getFirstImageHash(node: SceneNode): string | null {
+  const fills = (node as any).fills;
+  if (!fills || !Array.isArray(fills)) return null;
+  for (const f of fills) {
+    if (f && f.type === 'IMAGE' && f.visible !== false && (f as ImagePaint).imageHash) {
+      return (f as ImagePaint).imageHash || null;
+    }
+  }
+  return null;
 }
 
 /**
@@ -324,6 +384,7 @@ export function buildImageMap(
   tasks: ImageExportTask[],
   sections: { name: string; children: SceneNode[] }[],
   iconMap: Map<string, string>,
+  imageMap: Map<string, string>,
 ): ImageMap {
   const images: Record<string, ImageMapEntry> = {};
   const bySectionMap: Record<string, string[]> = {};
@@ -356,10 +417,14 @@ export function buildImageMap(
       }
 
       if (hasImageFill(node as any)) {
-        const filename = `${slugify(node.name)}.png`;
-        sectionImages.add(filename);
-        if (images[filename] && !images[filename].usedInSections.includes(section.name)) {
-          images[filename].usedInSections.push(section.name);
+        // Resolve via the shared imageMap so per-section refs match the
+        // filenames that actually landed in the ZIP (post collision-suffix).
+        const filename = imageMap.get(node.id);
+        if (filename) {
+          sectionImages.add(filename);
+          if (images[filename] && !images[filename].usedInSections.includes(section.name)) {
+            images[filename].usedInSections.push(section.name);
+          }
         }
       }
 

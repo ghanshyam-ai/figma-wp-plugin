@@ -159,7 +159,13 @@ export interface SectionStyles {
   paddingLeft: string | null;
   paddingRight: string | null;
   backgroundColor: string | null;
+  /** CSS-ready value for `background-image`. When the section frame itself
+   *  has an IMAGE fill, this resolves to `url(images/<slug>.png)`. */
   backgroundImage: string | null;
+  /** Bare filename of the section's background image (no `url(...)` wrapper).
+   *  Lets agents resolve the file via `image-map.json` even after the
+   *  packager renames extensions (e.g. .png → .jpg via magic-byte detection). */
+  backgroundImageFile?: string | null;
   backgroundGradient: string | null;
   minHeight: string | null;
   overflow: string | null;
@@ -180,7 +186,24 @@ export interface SectionStyles {
   borderLeftWidth?: string | null;
   borderColor?: string | null;
   borderStyle?: string | null;
+  /** Stroke alignment for the section's own border:
+   *  inside → CSS `box-sizing: border-box` border (default-friendly)
+   *  outside → CSS `outline` (border doesn't inflate the box)
+   *  center → no direct CSS equivalent; agent should pick `outline` + half-offset */
+  strokeAlign?: 'inside' | 'outside' | 'center' | null;
   opacity?: number | null;
+  /** Auto-layout → flex props. Populated when the section frame has
+   *  layoutMode HORIZONTAL or VERTICAL. */
+  display?: string | null;
+  flexDirection?: string | null;
+  justifyContent?: string | null;
+  alignItems?: string | null;
+  flexWrap?: string | null;
+  gap?: string | null;
+  rowGap?: string | null;
+  /** CSS `mix-blend-mode` from Figma's blendMode (multiply, overlay, screen, …).
+   *  null when blendMode is NORMAL or PASS_THROUGH. */
+  mixBlendMode?: string | null;
 }
 
 export interface ElementStyles {
@@ -285,6 +308,11 @@ export interface ElementStyles {
    *  Resolves relative to the page's images/ directory — the agent should
    *  inline this asset rather than treat it as a raster image. */
   iconFile?: string | null;
+  /** Raster image filename for elements with an IMAGE fill. Resolves relative
+   *  to the page's images/ directory. The packager may rename the extension
+   *  (PNG → JPG/WebP) based on the source format — agents should consult
+   *  `image-map.json` for the authoritative filename when this hint is stale. */
+  imageFile?: string | null;
   /** Component instance metadata — present when the node is a Figma INSTANCE.
    *  Lets the agent deduplicate repeated instances into a shared ACF block/pattern. */
   componentInstance?: ComponentInstanceInfo | null;
@@ -296,6 +324,33 @@ export interface ElementStyles {
    *  custom-property references (e.g. { color: "var(--clr-primary)" }).
    *  Agents should prefer these over raw hex/px values when present. */
   varBindings?: Record<string, string> | null;
+  /** CSS `mix-blend-mode` from Figma's blendMode (multiply, overlay, screen, …).
+   *  null when blendMode is NORMAL or PASS_THROUGH. Useful for image overlays. */
+  mixBlendMode?: string | null;
+  /** Stroke alignment from Figma — affects whether the border inflates dimensions:
+   *  inside → keeps box-size, agent should use `box-sizing: border-box`
+   *  outside → doesn't inflate, agent should emit `outline` instead of `border`
+   *  center → no direct CSS equivalent */
+  strokeAlign?: 'inside' | 'outside' | 'center' | null;
+  /** Figma's flex-wrap (`layoutWrap` property): 'wrap' or null. */
+  flexWrap?: string | null;
+  /** Row gap (used when flexWrap=wrap and counterAxisSpacing is set). */
+  rowGap?: string | null;
+  /** Layout-positioning mode for children INSIDE an auto-layout parent:
+   *  'auto' → child flows in the layout (default)
+   *  'absolute' → child is taken out of flow; pair with `top`/`left`/`right`/`bottom` */
+  layoutPositioning?: 'auto' | 'absolute' | null;
+  /** Layout constraint on the horizontal axis (only meaningful when the parent
+   *  is NOT auto-layout, or when layoutPositioning is 'absolute'):
+   *    min   → pin to left edge
+   *    center → stay centered horizontally
+   *    max   → pin to right edge
+   *    stretch → grow with parent width (left + right both anchored)
+   *    scale → resize proportionally with parent
+   */
+  constraintsHorizontal?: 'min' | 'center' | 'max' | 'stretch' | 'scale' | null;
+  /** Layout constraint on the vertical axis (analogous to horizontal). */
+  constraintsVertical?: 'min' | 'center' | 'max' | 'stretch' | 'scale' | null;
 }
 
 export interface TextSegment {

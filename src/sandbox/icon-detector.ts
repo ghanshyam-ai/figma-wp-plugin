@@ -14,8 +14,8 @@ import { slugify, isDefaultLayerName } from './utils';
  * and slug collisions get a numeric suffix.
  */
 
-const ICON_NAME_HINT = /\b(icon|chevron|arrow|caret|check|tick|close|cross|menu|burger|hamburger|search|plus|minus|star|heart|logo|social|symbol|glyph|play|pause|stop|next|prev|share|download|upload|edit|trash|delete|info|warning|error|success)\b/i;
-const ICON_SIZE_CAP = 128;
+const ICON_NAME_HINT = /\b(icon|chevron|arrow|caret|check|tick|close|cross|menu|burger|hamburger|search|plus|minus|star|heart|logo|social|symbol|glyph|play|pause|stop|next|prev|share|download|upload|edit|trash|delete|info|warning|error|success|facebook|twitter|instagram|linkedin|youtube|github|tiktok|whatsapp|telegram|discord|pinterest|snapchat|mail|envelope|phone|telephone|home|house|user|profile|account|lock|unlock|gear|settings|cog|bell|notification|calendar|clock|time|bookmark|tag|filter|sort|grid|list|map|pin|location|cart|bag|basket|wallet|card|gift|globe|world|link|external|copy|paste|refresh|reload|sync|eye|view|hide|visible|invisible|sun|moon|theme|light|dark|wifi|battery|camera|video|microphone|volume|mute|file|folder|attach|paperclip|cloud|database|chart|graph|trend|dot|divider|separator|shape|graphic|illustration|decoration|svg|vector|asset)\b/i;
+const ICON_SIZE_CAP = 256;
 
 /**
  * True if the node is "vector-only" — no TEXT, no IMAGE fill anywhere in
@@ -38,9 +38,14 @@ function isVectorOnly(n: SceneNode): boolean {
  * Predicate: is this node an icon root that should be exported as SVG?
  *
  * Heuristics (any one is sufficient):
- *   1. node.type === VECTOR or BOOLEAN_OPERATION (raw vector path / Union)
+ *   1. node.type === VECTOR / BOOLEAN_OPERATION / LINE (raw vector primitives)
  *   2. FRAME / GROUP / COMPONENT / INSTANCE whose entire subtree is vector-only
- *      AND is either small (<=128×128) OR has a name hint (icon, chevron, …)
+ *      AND any one of:
+ *        a. has a name hint (icon, logo, chevron, facebook, …) — any size
+ *        b. is small (≤256×256) — name irrelevant
+ *      Wrapper-as-single-icon export keeps multi-path logos composed; the
+ *      old 128px cap split a 200×200 logo into individually-disconnected
+ *      VECTOR exports. Bumping to 256 + name-hint override fixes that.
  *
  * Whatever this returns true for, image-exporter will queue an SVG export
  * AND section-parser will emit an `iconFile` reference on the matching element.
@@ -48,7 +53,8 @@ function isVectorOnly(n: SceneNode): boolean {
 export function isIconNode(node: SceneNode): boolean {
   if (node.visible === false) return false;
 
-  if (node.type === 'VECTOR' || node.type === 'BOOLEAN_OPERATION') {
+  // Pure vector primitives are always SVG-exportable.
+  if (node.type === 'VECTOR' || node.type === 'BOOLEAN_OPERATION' || node.type === 'LINE') {
     return true;
   }
 

@@ -9,7 +9,7 @@ import { collectFonts, countTextNodes } from './typography';
 import { collectSpacing } from './spacing';
 import { parseSections } from './section-parser';
 import { matchResponsiveFrames } from './responsive';
-import { buildExportTasks, executeBatchExport, buildImageMap } from './image-exporter';
+import { buildExportTasks, executeBatchExport, buildImageMap, buildImageFilenameMap } from './image-exporter';
 import { extractVariables } from './variables';
 import { normalizeSectionName } from './patterns';
 import { buildIconFilenameMap } from './icon-detector';
@@ -52,14 +52,17 @@ export async function runExtraction(
       label: `Extracting "${pair.pageName}"...`,
     });
 
-    // ── Build the icon filename map FIRST so section-parser and the
-    //    image-exporter agree on which nodes are icons and what filenames
-    //    they receive. This is the linchpin that prevents
-    //    "section-spec references X.svg but X.svg doesn't exist". ──
+    // ── Build the icon AND raster-image filename maps FIRST so section-parser
+    //    and image-exporter agree on (a) which nodes are icons vs raster
+    //    images and (b) what filename each one receives. Without this shared
+    //    state the spec ends up referencing files that never made it into
+    //    the ZIP, which is the original "icon/image missing" bug. ──
     const iconMap = buildIconFilenameMap(desktopFrame);
+    const iconRootIds = new Set(iconMap.keys());
+    const imageMap = buildImageFilenameMap(desktopFrame, iconRootIds);
 
     // ── Parse sections from desktop frame ──
-    const sections = parseSections(desktopFrame, iconMap, globalNames);
+    const sections = parseSections(desktopFrame, iconMap, imageMap, globalNames);
     const sectionCount = Object.keys(sections).length;
     totalSections += sectionCount;
 
@@ -69,7 +72,9 @@ export async function runExtraction(
       if (mobileNode && mobileNode.type === 'FRAME') {
         const mobileFrame = mobileNode as FrameNode;
         const mobileIconMap = buildIconFilenameMap(mobileFrame);
-        const mobileSections = parseSections(mobileFrame, mobileIconMap, globalNames);
+        const mobileIconRootIds = new Set(mobileIconMap.keys());
+        const mobileImageMap = buildImageFilenameMap(mobileFrame, mobileIconRootIds);
+        const mobileSections = parseSections(mobileFrame, mobileIconMap, mobileImageMap, globalNames);
         mergeResponsiveData(sections, mobileSections, pair.mobile.width);
       }
     }
@@ -112,7 +117,7 @@ export async function runExtraction(
     }
 
     // ── Export images and screenshots ──
-    const exportTasks = buildExportTasks(desktopFrame, pair.pageSlug, iconMap);
+    const exportTasks = buildExportTasks(desktopFrame, pair.pageSlug, iconMap, imageMap);
     const assetCount = exportTasks.filter(t => t.type === 'asset').length;
     totalImages += assetCount;
 
@@ -183,11 +188,11 @@ export async function runExtraction(
     const sectionChildren = desktopFrame.children
       .filter(c => c.visible !== false)
       .map(c => ({ name: c.name, children: 'children' in c ? [...(c as FrameNode).children] : [] }));
-    const imageMap = buildImageMap(exportTasks, sectionChildren, iconMap);
+    const imageMapJson = buildImageMap(exportTasks, sectionChildren, iconMap, imageMap);
     sendMessage({
       type: 'IMAGE_MAP_DATA',
       path: `pages/${pair.pageSlug}/images`,
-      imageMap,
+      imageMap: imageMapJson,
     });
 
     // ── Build manifest page entry ──

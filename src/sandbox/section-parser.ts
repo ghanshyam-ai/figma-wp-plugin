@@ -1,6 +1,6 @@
 import { SectionSpec, SectionStyles, ElementStyles, OverlapInfo, LayerInfo, CompositionInfo, FormFieldInfo, TextContentEntry, ComponentInstanceInfo } from './types';
-import { toCssValue, toLayoutName, screenshotFilename, computeAspectRatio, isDefaultLayerName } from './utils';
-import { extractBackgroundColor, extractGradient, hasImageFill, extractBorderStyle, extractBorderWidths, extractStrokeColor } from './color';
+import { toCssValue, toLayoutName, screenshotFilename, computeAspectRatio, isDefaultLayerName, slugify } from './utils';
+import { extractBackgroundColor, extractGradient, hasImageFill, extractBorderStyle, extractBorderWidths, extractStrokeColor, extractStrokeAlign, extractMixBlendMode } from './color';
 import { extractTypography } from './typography';
 import { extractAutoLayoutSpacing, extractAbsoluteSpacing } from './spacing';
 import { detectGrid } from './grid';
@@ -47,12 +47,20 @@ function identifySections(pageFrame: FrameNode): SceneNode[] {
 /**
  * Extract section-level styles from a frame.
  */
-function extractSectionStyles(node: SceneNode): SectionStyles {
+function extractSectionStyles(node: SceneNode, imageMap: Map<string, string>): SectionStyles {
   const bg = extractBackgroundColor(node as any);
   const gradient = extractGradient(node as any);
   const bounds = node.absoluteBoundingBox;
   const effects = extractEffects(node as any);
   const corners = extractPerCornerRadius(node as any);
+
+  // Section frame's own IMAGE fill — resolve via shared imageMap so the
+  // spec references exactly what image-exporter wrote (after dedup +
+  // collision-suffixing). Falls back to slugified name when the section
+  // node isn't in the map (e.g. image fill detected but no resolvable hash).
+  const sectionBgFile = hasImageFill(node as any)
+    ? (imageMap.get(node.id) || `${slugify(node.name)}.png`)
+    : null;
 
   const styles: SectionStyles = {
     paddingTop: null,  // Set by spacing extractor
@@ -60,7 +68,8 @@ function extractSectionStyles(node: SceneNode): SectionStyles {
     paddingLeft: null,
     paddingRight: null,
     backgroundColor: bg,
-    backgroundImage: hasImageFill(node as any) ? 'url(...)' : null,
+    backgroundImage: sectionBgFile ? `url(images/${sectionBgFile})` : null,
+    backgroundImageFile: sectionBgFile,
     backgroundGradient: gradient,
     minHeight: bounds ? toCssValue(bounds.height) : null,
     overflow: null,
@@ -82,6 +91,11 @@ function extractSectionStyles(node: SceneNode): SectionStyles {
   if ('opacity' in node && typeof (node as any).opacity === 'number' && (node as any).opacity < 1) {
     styles.opacity = Math.round((node as any).opacity * 100) / 100;
   }
+  // Auto-layout flex props on the section frame itself
+  Object.assign(styles, extractAutoLayoutFlex(node as any));
+  // Blend mode (multiply / overlay / screen / …)
+  const blend = extractMixBlendMode(node as any);
+  if (blend) styles.mixBlendMode = blend;
   return styles;
 }
 
@@ -120,6 +134,96 @@ function extractPerCornerRadius(node: any): {
 }
 
 /**
+ * Map Figma's auto-layout primary/counter-axis alignment to CSS flex props.
+ * Only applies to frames with `layoutMode === 'HORIZONTAL' | 'VERTICAL'`.
+ *
+ * Returns a partial object with display/flexDirection/justifyContent/alignItems/flexWrap/
+ * gap/rowGap. Empty when the frame isn't auto-layout, so callers can spread
+ * unconditionally.
+ *
+ * Figma → CSS axis mapping:
+ *   Horizontal layout: primary = horizontal, counter = vertical
+ *     → primaryAxisAlignItems → justify-content, counterAxisAlignItems → align-items
+ *   Vertical layout: primary = vertical, counter = horizontal
+ *     → primaryAxisAlignItems → justify-content (flex-direction:column), counter → align-items
+ *
+ * Value mapping:
+ *   MIN → flex-start, CENTER → center, MAX → flex-end, SPACE_BETWEEN → space-between
+ *   counter BASELINE → baseline (only valid for horizontal layouts)
+ */
+function extractAutoLayoutFlex(frame: any): Partial<ElementStyles> & Partial<SectionStyles> {
+  if (!frame || !frame.layoutMode || frame.layoutMode === 'NONE') return {};
+  const out: Partial<ElementStyles> & Partial<SectionStyles> = {};
+  out.display = 'flex';
+  out.flexDirection = frame.layoutMode === 'HORIZONTAL' ? 'row' : 'column';
+
+  const mapPrimary = (v: string | undefined): string | null => {
+    switch (v) {
+      case 'MIN': return 'flex-start';
+      case 'CENTER': return 'center';
+      case 'MAX': return 'flex-end';
+      case 'SPACE_BETWEEN': return 'space-between';
+      default: return null;
+    }
+  };
+  const mapCounter = (v: string | undefined): string | null => {
+    switch (v) {
+      case 'MIN': return 'flex-start';
+      case 'CENTER': return 'center';
+      case 'MAX': return 'flex-end';
+      case 'BASELINE': return 'baseline';
+      default: return null;
+    }
+  };
+  const jc = mapPrimary(frame.primaryAxisAlignItems);
+  const ai = mapCounter(frame.counterAxisAlignItems);
+  if (jc) out.justifyContent = jc;
+  if (ai) out.alignItems = ai;
+
+  if (frame.layoutWrap === 'WRAP') {
+    out.flexWrap = 'wrap';
+    if (typeof frame.counterAxisSpacing === 'number' && frame.counterAxisSpacing > 0) {
+      out.rowGap = toCssValue(frame.counterAxisSpacing);
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Map Figma layout constraints ('MIN' | 'CENTER' | 'MAX' | 'STRETCH' | 'SCALE')
+ * to lowercase tokens. Constraints describe how a child anchors when its
+ * parent resizes — only meaningful for non-auto-layout parents OR for
+ * absolutely-positioned children inside an auto-layout parent.
+ */
+function extractConstraints(node: any): { horizontal?: any; vertical?: any } {
+  const c = node?.constraints;
+  if (!c || typeof c !== 'object') return {};
+  const map = (v: string | undefined): any => {
+    if (v === 'MIN') return 'min';
+    if (v === 'CENTER') return 'center';
+    if (v === 'MAX') return 'max';
+    if (v === 'STRETCH') return 'stretch';
+    if (v === 'SCALE') return 'scale';
+    return null;
+  };
+  return { horizontal: map(c.horizontal), vertical: map(c.vertical) };
+}
+
+/**
+ * Detect whether the node is positioned absolutely INSIDE its auto-layout
+ * parent (Figma's `layoutPositioning === 'ABSOLUTE'`). When true the agent
+ * should emit `position: absolute` and use bounding-box offsets + the
+ * extracted constraints to anchor it correctly.
+ */
+function extractLayoutPositioning(node: any): 'auto' | 'absolute' | null {
+  const p = node?.layoutPositioning;
+  if (p === 'ABSOLUTE') return 'absolute';
+  if (p === 'AUTO') return 'auto';
+  return null;
+}
+
+/**
  * Apply per-corner radius. If all 4 are equal, emit borderRadius shorthand;
  * otherwise emit the 4 explicit values. Works on ElementStyles or SectionStyles.
  */
@@ -145,12 +249,14 @@ function applyStrokes(elem: Partial<ElementStyles> & Partial<SectionStyles>, nod
   const color = extractStrokeColor(node);
   const widths = extractBorderWidths(node);
   const style = extractBorderStyle(node);
+  const align = extractStrokeAlign(node);
   if (!color) return;
 
   if (widths.uniform !== null) {
     elem.borderWidth = toCssValue(widths.uniform);
     elem.borderColor = color;
     elem.borderStyle = style;
+    if (align) elem.strokeAlign = align;
     return;
   }
   if (widths.top || widths.right || widths.bottom || widths.left) {
@@ -160,6 +266,7 @@ function applyStrokes(elem: Partial<ElementStyles> & Partial<SectionStyles>, nod
     if (widths.left) elem.borderLeftWidth = toCssValue(widths.left);
     elem.borderColor = color;
     elem.borderStyle = style;
+    if (align) elem.strokeAlign = align;
   }
 }
 
@@ -462,6 +569,22 @@ function applyCommonSignals(elem: Partial<ElementStyles>, node: SceneNode): void
 
   const vars = extractBoundVariables(node);
   if (vars) elem.varBindings = vars;
+
+  // Blend mode (mix-blend-mode)
+  const blend = extractMixBlendMode(node as any);
+  if (blend) elem.mixBlendMode = blend;
+
+  // Layout positioning inside an auto-layout parent: 'auto' | 'absolute'.
+  // We only emit when ABSOLUTE — 'auto' is the default and would just be noise.
+  const lp = extractLayoutPositioning(node as any);
+  if (lp === 'absolute') elem.layoutPositioning = 'absolute';
+
+  // Layout constraints (only meaningful for non-auto-layout parents OR
+  // absolutely-positioned children inside auto-layout). We always emit when
+  // present — agent decides whether they apply based on context.
+  const cons = extractConstraints(node as any);
+  if (cons.horizontal) elem.constraintsHorizontal = cons.horizontal;
+  if (cons.vertical) elem.constraintsVertical = cons.vertical;
 }
 
 /**
@@ -553,6 +676,7 @@ function buildIconElement(node: SceneNode, filename: string): Partial<ElementSty
 function extractElements(
   sectionNode: SceneNode,
   iconMap: Map<string, string>,
+  imageMap: Map<string, string>,
 ): Record<string, Partial<ElementStyles>> {
   const elements: Record<string, Partial<ElementStyles>> = {};
   let textIndex = 0;
@@ -682,7 +806,12 @@ function extractElements(
       const imgEffects = extractEffects(node as any);
       const imgObjectPosition = extractObjectPosition(node);
       const imgCorners = extractPerCornerRadius(node as any);
+      // image-exporter writes raster fills using the shared imageMap.
+      // Resolve through the same map so the spec's `imageFile` matches the
+      // exact filename the ZIP contains (after dedup + suffixing).
+      const imgFilename = imageMap.get(node.id) || `${slugify(node.name)}.png`;
       const imgElem: Partial<ElementStyles> = {
+        imageFile: imgFilename,
         width: isBackgroundImage ? '100%' : toCssValue(Math.round(bounds.width)),
         height: isBackgroundImage ? '100%' : 'auto',
         aspectRatio: isBackgroundImage ? null : computeAspectRatio(bounds.width, bounds.height),
@@ -739,6 +868,11 @@ function extractElements(
           buttonStyles.paddingBottom = toCssValue(frame.paddingBottom);
           buttonStyles.paddingLeft = toCssValue(frame.paddingLeft);
           buttonStyles.paddingRight = toCssValue(frame.paddingRight);
+          if (typeof frame.itemSpacing === 'number' && frame.itemSpacing > 0) {
+            buttonStyles.gap = toCssValue(frame.itemSpacing);
+          }
+          // Flex layout (icon + label etc.)
+          Object.assign(buttonStyles, extractAutoLayoutFlex(frame));
         }
 
         applyRadius(buttonStyles, frame);
@@ -835,6 +969,8 @@ function extractElements(
         if (typeof frame.itemSpacing === 'number' && frame.itemSpacing > 0) {
           containerStyles.gap = toCssValue(frame.itemSpacing);
         }
+        // Flex direction + alignment from auto-layout
+        Object.assign(containerStyles, extractAutoLayoutFlex(frame));
       }
 
       applyRadius(containerStyles, frame);
@@ -1251,6 +1387,7 @@ function extractTextContentInOrder(sectionNode: SceneNode): TextContentEntry[] {
 export function parseSections(
   pageFrame: FrameNode,
   iconMap: Map<string, string>,
+  imageMap: Map<string, string>,
   globalNames?: Set<string>,
 ): Record<string, SectionSpec> {
   const sectionNodes = identifySections(pageFrame);
@@ -1290,14 +1427,14 @@ export function parseSections(
     }
 
     // Base section styles (background, gradient, etc.)
-    const baseStyles = extractSectionStyles(node);
+    const baseStyles = extractSectionStyles(node, imageMap);
     const mergedStyles: SectionStyles = {
       ...baseStyles,
       ...sectionStyles,
     };
 
     // Elements
-    const elements = extractElements(node, iconMap);
+    const elements = extractElements(node, iconMap, imageMap);
 
     // Grid detection
     const grid = frame ? detectGrid(frame) : {

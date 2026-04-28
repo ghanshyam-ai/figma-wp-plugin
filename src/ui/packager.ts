@@ -73,18 +73,9 @@ export async function buildExportZip(data: ExportData): Promise<Blob> {
     const pageDir = zip.folder(`pages/${page.slug}`)!;
     const figmaDir = pageDir.folder('figma')!;
 
-    // Core JSON files
-    figmaDir.file('section-specs.json', JSON.stringify(page.sectionSpecs, null, 2));
-    figmaDir.file('spec.md', page.specMd);
-    figmaDir.file('tokens.json', JSON.stringify(page.tokens, null, 2));
-
-    // Screenshots (always PNG — rendered composites)
-    const ssDir = figmaDir.folder('screenshots')!;
-    for (const ss of page.screenshots) {
-      ssDir.file(ss.filename, ss.data);
-    }
-
-    // Images — detect real format and rename extension if needed
+    // Images — detect real format FIRST so we know the rename map before
+    // serializing section-specs.json (otherwise the spec references .png
+    // while the actual file landed as .jpg/.webp).
     const imgDir = figmaDir.folder('images')!;
     const renames: Record<string, string> = {}; // old filename -> new filename
     for (const img of page.images) {
@@ -95,6 +86,20 @@ export async function buildExportZip(data: ExportData): Promise<Blob> {
         renames[img.filename] = finalFilename;
       }
       imgDir.file(finalFilename, img.data);
+    }
+
+    // Core JSON files — patch section-specs.json with the rename map so
+    // every iconFile / imageFile / backgroundImageFile / backgroundImage
+    // reference points at the file that actually landed in the ZIP.
+    const patchedSpecs = patchSectionSpecsRenames(page.sectionSpecs, renames);
+    figmaDir.file('section-specs.json', JSON.stringify(patchedSpecs, null, 2));
+    figmaDir.file('spec.md', page.specMd);
+    figmaDir.file('tokens.json', JSON.stringify(patchTokensRenames(page.tokens, renames), null, 2));
+
+    // Screenshots (always PNG — rendered composites)
+    const ssDir = figmaDir.folder('screenshots')!;
+    for (const ss of page.screenshots) {
+      ssDir.file(ss.filename, ss.data);
     }
 
     // Patch image-map.json so downstream tools reference the renamed files
@@ -109,6 +114,71 @@ export async function buildExportZip(data: ExportData): Promise<Blob> {
     compression: 'DEFLATE',
     compressionOptions: { level: 6 },
   });
+}
+
+/**
+ * Apply file-extension renames throughout section-specs.json so every
+ * `iconFile` / `imageFile` / `backgroundImageFile` / `backgroundImage` URL
+ * reference matches the filename that actually landed in the ZIP. Without
+ * this, raw JPGs/WebPs sourced from Figma fills break — the spec would
+ * reference `hero.png` but the file is `hero.jpg`.
+ */
+function patchSectionSpecsRenames(specs: any, renames: Record<string, string>): any {
+  if (!specs || !specs.sections || Object.keys(renames).length === 0) return specs;
+  // Deep clone via JSON round-trip — section specs are pure data, no functions.
+  const patched = JSON.parse(JSON.stringify(specs));
+
+  for (const sectionKey of Object.keys(patched.sections || {})) {
+    const sec = patched.sections[sectionKey];
+    if (!sec) continue;
+
+    // Section-level background image
+    if (sec.section) {
+      const bf = sec.section.backgroundImageFile;
+      if (bf && renames[bf]) sec.section.backgroundImageFile = renames[bf];
+      const bgUrl = sec.section.backgroundImage;
+      if (typeof bgUrl === 'string') {
+        sec.section.backgroundImage = bgUrl.replace(/url\(images\/([^)]+)\)/g, (_match, file) => {
+          return `url(images/${renames[file] || file})`;
+        });
+      }
+    }
+
+    // Per-element references
+    for (const elemKey of Object.keys(sec.elements || {})) {
+      const el = sec.elements[elemKey];
+      if (!el) continue;
+      if (el.imageFile && renames[el.imageFile]) el.imageFile = renames[el.imageFile];
+      if (el.iconFile && renames[el.iconFile]) el.iconFile = renames[el.iconFile];
+    }
+
+    // Repeater item images
+    if (sec.repeaters && typeof sec.repeaters === 'object') {
+      for (const rep of Object.values(sec.repeaters as Record<string, any>)) {
+        if (!rep || !Array.isArray(rep.items)) continue;
+        for (const item of rep.items) {
+          if (item.imageFile && renames[item.imageFile]) item.imageFile = renames[item.imageFile];
+        }
+      }
+    }
+  }
+
+  return patched;
+}
+
+/**
+ * Patch tokens.json so per-section `image_files` arrays reference the
+ * post-rename filenames.
+ */
+function patchTokensRenames(tokens: any, renames: Record<string, string>): any {
+  if (!tokens || !Array.isArray(tokens.sections) || Object.keys(renames).length === 0) return tokens;
+  const patched = JSON.parse(JSON.stringify(tokens));
+  for (const sec of patched.sections) {
+    if (Array.isArray(sec.image_files)) {
+      sec.image_files = sec.image_files.map((f: string) => renames[f] || f);
+    }
+  }
+  return patched;
 }
 
 /**

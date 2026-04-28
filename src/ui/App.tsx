@@ -96,6 +96,20 @@ export function App() {
     return pairs;
   }, []);
 
+  // Get-or-create the page entry. Image/screenshot messages stream from the
+  // sandbox BEFORE PAGE_DATA arrives (extractor patches iconFile refs after
+  // exports finish, then sends PAGE_DATA), so handlers must create the entry
+  // on demand or binary data is silently dropped.
+  const getOrCreatePage = useCallback((slug: string): PageData => {
+    let p = pageDataMap.get(slug);
+    if (!p) {
+      p = { slug, sectionSpecs: null, specMd: '', tokens: null,
+            screenshots: [], images: [], imageMap: null };
+      pageDataMap.set(slug, p);
+    }
+    return p;
+  }, [pageDataMap]);
+
   // Handle messages from sandbox
   usePluginMessages(useCallback((msg: any) => {
     switch (msg.type) {
@@ -104,46 +118,28 @@ export function App() {
         break;
 
       case 'PAGE_DATA': {
-        const existing = pageDataMap.get(msg.pageSlug) || {
-          slug: msg.pageSlug,
-          sectionSpecs: null,
-          specMd: '',
-          tokens: null,
-          screenshots: [],
-          images: [],
-          imageMap: null,
-        };
+        const existing = getOrCreatePage(msg.pageSlug);
         existing.sectionSpecs = msg.sectionSpecs;
         existing.specMd = msg.specMd;
         existing.tokens = msg.tokens;
-        pageDataMap.set(msg.pageSlug, existing);
         break;
       }
 
       case 'SCREENSHOT_DATA': {
         const slug = msg.path.split('/')[1];
-        const existing = pageDataMap.get(slug);
-        if (existing) {
-          existing.screenshots.push({ filename: msg.filename, data: msg.data });
-        }
+        getOrCreatePage(slug).screenshots.push({ filename: msg.filename, data: msg.data });
         break;
       }
 
       case 'IMAGE_DATA': {
         const slug = msg.path.split('/')[1];
-        const existing = pageDataMap.get(slug);
-        if (existing) {
-          existing.images.push({ filename: msg.filename, data: msg.data });
-        }
+        getOrCreatePage(slug).images.push({ filename: msg.filename, data: msg.data });
         break;
       }
 
       case 'IMAGE_MAP_DATA': {
         const slug = msg.path.split('/')[1];
-        const existing = pageDataMap.get(slug);
-        if (existing) {
-          existing.imageMap = msg.imageMap;
-        }
+        getOrCreatePage(slug).imageMap = msg.imageMap;
         break;
       }
 
@@ -176,7 +172,7 @@ export function App() {
         setStep('select');
         break;
     }
-  }, [pageDataMap]));
+  }, [pageDataMap, getOrCreatePage]));
 
   // Step handlers
   const handlePageSelect = (frameIds: string[], pages: any[]) => {

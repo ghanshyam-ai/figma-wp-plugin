@@ -55,26 +55,125 @@ export function extractTextColor(node: TextNode): string | null {
 }
 
 /**
+ * Decode the CSS gradient angle from Figma's `gradientTransform` matrix.
+ *
+ * Figma's gradientTransform is a 2×3 affine matrix that maps actual
+ * coordinates back to the unit gradient line (0,0)→(1,0). Inverting the
+ * linear part gives the gradient direction in actual coordinates. We then
+ * convert that vector to a CSS angle, where 0deg = "to top" and angles
+ * increase clockwise.
+ *
+ * Returns 180 (the CSS default for top-to-bottom) when the matrix is
+ * absent or singular, so output stays sensible on edge-case fills.
+ */
+function gradientAngleFromTransform(t: number[][] | undefined): number {
+  if (!t || !Array.isArray(t) || t.length < 2) return 180;
+  const a = t[0][0], b = t[0][1];
+  const c = t[1][0], d = t[1][1];
+  const det = a * d - b * c;
+  if (Math.abs(det) < 1e-9) return 180;
+  // Direction vector in actual coordinates: inv(linear) * (1, 0) = (d/det, -c/det)
+  const vx = d / det;
+  const vy = -c / det;
+  // CSS angle: 0deg = up, +90 = right, +180 = down. atan2(vx, -vy) gives that.
+  let deg = Math.atan2(vx, -vy) * (180 / Math.PI);
+  if (deg < 0) deg += 360;
+  return Math.round(deg);
+}
+
+/**
  * Extract gradient as CSS string, or null if not a gradient.
+ *
+ * Supports linear, radial, angular (CSS conic-gradient), and diamond
+ * (approximated with radial-gradient — no exact CSS equivalent). The
+ * angle of linear gradients is decoded from `gradientTransform`, so
+ * `linear-gradient(45deg, …)` and `linear-gradient(225deg, …)` no
+ * longer collapse to the default direction.
  */
 export function extractGradient(node: SceneNode & { fills?: readonly Paint[] }): string | null {
   if (!('fills' in node) || !node.fills || !Array.isArray(node.fills)) return null;
 
   for (const fill of node.fills) {
-    if (fill.type === 'GRADIENT_LINEAR' && fill.visible !== false) {
-      const stops = fill.gradientStops
+    if (fill.visible === false) continue;
+    if (fill.type === 'GRADIENT_LINEAR' || fill.type === 'GRADIENT_RADIAL' ||
+        fill.type === 'GRADIENT_ANGULAR' || fill.type === 'GRADIENT_DIAMOND') {
+      const g = fill as GradientPaint;
+      const stops = g.gradientStops
         .map(s => `${rgbToHex(s.color)} ${Math.round(s.position * 100)}%`)
         .join(', ');
-      return `linear-gradient(${stops})`;
-    }
-    if (fill.type === 'GRADIENT_RADIAL' && fill.visible !== false) {
-      const stops = fill.gradientStops
-        .map(s => `${rgbToHex(s.color)} ${Math.round(s.position * 100)}%`)
-        .join(', ');
-      return `radial-gradient(${stops})`;
+      const opacity = (g as any).opacity;
+      const stopsWithAlpha = opacity !== undefined && opacity < 1
+        ? g.gradientStops.map(s => {
+            const a = (s.color.a ?? 1) * opacity;
+            return `rgba(${Math.round(s.color.r * 255)}, ${Math.round(s.color.g * 255)}, ${Math.round(s.color.b * 255)}, ${Math.round(a * 100) / 100}) ${Math.round(s.position * 100)}%`;
+          }).join(', ')
+        : stops;
+
+      switch (fill.type) {
+        case 'GRADIENT_LINEAR': {
+          const angle = gradientAngleFromTransform((g as any).gradientTransform);
+          return `linear-gradient(${angle}deg, ${stopsWithAlpha})`;
+        }
+        case 'GRADIENT_RADIAL':
+          return `radial-gradient(${stopsWithAlpha})`;
+        case 'GRADIENT_ANGULAR':
+          // Figma's angular = CSS conic-gradient. The `from` angle could be
+          // decoded from gradientTransform too, but most agents are happy
+          // with the default starting angle. Refine if needed.
+          return `conic-gradient(${stopsWithAlpha})`;
+        case 'GRADIENT_DIAMOND':
+          // No exact CSS equivalent; closest is radial-gradient. Agent should
+          // be aware this is an approximation (diamond ≠ radial circle).
+          return `radial-gradient(${stopsWithAlpha}) /* approximated from Figma diamond gradient */`;
+      }
     }
   }
   return null;
+}
+
+/**
+ * Map Figma's strokeAlign ('INSIDE' | 'OUTSIDE' | 'CENTER') to a lowercase
+ * CSS-friendly token. Returns null when the node has no resolvable strokeAlign.
+ */
+export function extractStrokeAlign(node: any): 'inside' | 'outside' | 'center' | null {
+  const s = node?.strokeAlign;
+  if (s === 'INSIDE') return 'inside';
+  if (s === 'OUTSIDE') return 'outside';
+  if (s === 'CENTER') return 'center';
+  return null;
+}
+
+/**
+ * Map Figma's blendMode to CSS `mix-blend-mode`. Returns null for NORMAL
+ * and PASS_THROUGH (which are CSS defaults).
+ */
+export function extractMixBlendMode(node: any): string | null {
+  const bm = node?.blendMode;
+  if (!bm || typeof bm !== 'string') return null;
+  switch (bm) {
+    case 'NORMAL':
+    case 'PASS_THROUGH':
+      return null;
+    case 'MULTIPLY': return 'multiply';
+    case 'SCREEN': return 'screen';
+    case 'OVERLAY': return 'overlay';
+    case 'DARKEN': return 'darken';
+    case 'LIGHTEN': return 'lighten';
+    case 'COLOR_DODGE': return 'color-dodge';
+    case 'COLOR_BURN': return 'color-burn';
+    case 'HARD_LIGHT': return 'hard-light';
+    case 'SOFT_LIGHT': return 'soft-light';
+    case 'DIFFERENCE': return 'difference';
+    case 'EXCLUSION': return 'exclusion';
+    case 'HUE': return 'hue';
+    case 'SATURATION': return 'saturation';
+    case 'COLOR': return 'color';
+    case 'LUMINOSITY': return 'luminosity';
+    // Approximations — no direct CSS equivalent
+    case 'LINEAR_BURN': return 'multiply';
+    case 'LINEAR_DODGE': return 'screen';
+    default: return null;
+  }
 }
 
 /**
